@@ -1,0 +1,32 @@
+QUICK STEPS TO FIX FILE WATCHER ERROR
+=====================================
+
+OPTION 1: Using Registry Editor (EASIEST)
+------------------------------------------
+1. Press Win + R
+2. Type: regedit
+3. Press Enter, click Yes for admin permission
+4. Navigate to:
+   HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\FileSystem
+5. Right-click → New → DWORD (32-bit) Value
+6. Name: MaxWatchers
+7. Double-click → Set value to: 524288
+8. Click OK
+9. RESTART YOUR COMPUTER
+10. After restart: npm start
+
+OPTION 2: PowerShell Command
+------------------------------
+1. Right-click PowerShell → Run as Administrator
+2. Run this command:
+   New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "MaxWatchers" -Value 524288 -PropertyType DWORD -Force
+3. RESTART YOUR COMPUTER
+4. After restart: npm start
+
+OPTION 3: Move Project to C: Drive
+-----------------------------------
+1. Copy project to: C:\Projects\Krushi-Express-Latur\customer-app-v2
+2. cd C:\Projects\Krushi-Express-Latur\customer-app-v2
+3. npm start
+
+

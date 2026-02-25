@@ -1,14 +1,15 @@
 {
   "expo": {
-    "name": "customer-app-v2",
-    "slug": "customer-app-v2",
+    "name": "Krushi Express",
+    "slug": "krushi-express",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/images/Krushi.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
+    "scheme": "krushiexpress",
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/images/Krushi.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
@@ -17,14 +18,26 @@
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        "foregroundImage": "./assets/images/Krushi.png",
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION"
+      ]
     },
     "web": {
-      "favicon": "./assets/favicon.png"
+      "favicon": "./assets/images/Krushi.png"
+    },
+    "plugins": [
+      "expo-secure-store"
+    ],
+    "extra": {
+      
+      "SOCKET_IO_URL": "http://192.168.12.81:5000",
+      "API_BASE_URL": "http://192.168.12.81:5000",
+      "CLOUDINARY_CLOUD_NAME": "dvzg4pod2"
     }
   }
 }
