@@ -11,8 +11,10 @@ import {
   Platform,
   ActivityIndicator,
   SafeAreaView,
+  Animated,
+  Modal,
 } from 'react-native';
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { useRouter } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { customerAuthAPI } from '../services/api';
@@ -39,6 +41,35 @@ export default function Register() {
   const [phoneError, setPhoneError] = useState('');
   const [passwordError, setPasswordError] = useState('');
   const [confirmPasswordError, setConfirmPasswordError] = useState('');
+  const [successVisible, setSuccessVisible] = useState(false);
+  const [registeredName, setRegisteredName] = useState('');
+
+  // Success animation values
+  const successScale = useRef(new Animated.Value(0)).current;
+  const successOpacity = useRef(new Animated.Value(0)).current;
+  const checkScale = useRef(new Animated.Value(0)).current;
+  const checkOpacity = useRef(new Animated.Value(0)).current;
+
+  const showSuccessModal = (userName: string) => {
+    setRegisteredName(userName);
+    setSuccessVisible(true);
+    successScale.setValue(0.5);
+    successOpacity.setValue(0);
+    checkScale.setValue(0);
+    checkOpacity.setValue(0);
+
+    Animated.sequence([
+      Animated.parallel([
+        Animated.spring(successScale, { toValue: 1, tension: 60, friction: 8, useNativeDriver: true }),
+        Animated.timing(successOpacity, { toValue: 1, duration: 300, useNativeDriver: true }),
+      ]),
+      Animated.delay(150),
+      Animated.parallel([
+        Animated.spring(checkScale, { toValue: 1, tension: 80, friction: 6, useNativeDriver: true }),
+        Animated.timing(checkOpacity, { toValue: 1, duration: 250, useNativeDriver: true }),
+      ]),
+    ]).start();
+  };
   
   const emailInputRef = useRef<TextInput>(null);
   const phoneInputRef = useRef<TextInput>(null);
@@ -235,24 +266,7 @@ export default function Register() {
         await AsyncStorage.setItem('userName', userName);
 
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        Alert.alert(
-          '✓ Account Created Successfully',
-          'Your account has been created successfully! Please login to continue.',
-          [
-            { 
-              text: 'Go to Login', 
-              onPress: () => {
-                // Clear form
-                setName('');
-                setEmail('');
-                setPhone('');
-                setPassword('');
-                setConfirmPassword('');
-                router.replace('/login');
-              }
-            }
-          ]
-        );
+        showSuccessModal(userName);
       } else {
         throw new Error(response.message || 'Could not create account');
       }
@@ -264,8 +278,63 @@ export default function Register() {
     }
   };
 
+  const handleGoToLogin = () => {
+    setSuccessVisible(false);
+    setName(''); setEmail(''); setPhone(''); setPassword(''); setConfirmPassword('');
+    router.replace('/login');
+  };
+
   return (
     <SafeAreaView style={styles.safeArea}>
+      {/* ── Success Modal ── */}
+      <Modal transparent animationType="none" visible={successVisible} onRequestClose={() => {}}>
+        <Animated.View style={[styles.modalOverlay, { opacity: successOpacity }]}>
+          <Animated.View style={[styles.successCard, { transform: [{ scale: successScale }] }]}>
+
+            {/* Checkmark circle */}
+            <Animated.View style={[styles.checkCircleOuter, { transform: [{ scale: checkScale }], opacity: checkOpacity }]}>
+              <View style={styles.checkCircleInner}>
+                <Icon name="check" size={48} color="#fff" />
+              </View>
+            </Animated.View>
+
+            {/* Confetti dots */}
+            <View style={styles.dotsRow}>
+              {['#4CAF50','#FFC107','#2196F3','#E91E63','#FF9800'].map((c, i) => (
+                <View key={i} style={[styles.dot, { backgroundColor: c }]} />
+              ))}
+            </View>
+
+            <Text style={styles.successTitle}>Account Created!</Text>
+            <Text style={styles.successGreeting}>Welcome, {registeredName} 🌾</Text>
+            <Text style={styles.successBody}>
+              Your Krushi Express account is ready.{'\n'}
+              Start booking agricultural transport today!
+            </Text>
+
+            {/* Info pills */}
+            <View style={styles.pillsRow}>
+              <View style={styles.pill}>
+                <Icon name="local-shipping" size={16} color="#4CAF50" />
+                <Text style={styles.pillText}>Book Trips</Text>
+              </View>
+              <View style={styles.pill}>
+                <Icon name="track-changes" size={16} color="#4CAF50" />
+                <Text style={styles.pillText}>Track Live</Text>
+              </View>
+              <View style={styles.pill}>
+                <Icon name="security" size={16} color="#4CAF50" />
+                <Text style={styles.pillText}>Secure</Text>
+              </View>
+            </View>
+
+            <TouchableOpacity style={styles.successBtn} onPress={handleGoToLogin} activeOpacity={0.85}>
+              <Text style={styles.successBtnText}>Continue to Login</Text>
+              <Icon name="arrow-forward" size={20} color="#fff" />
+            </TouchableOpacity>
+          </Animated.View>
+        </Animated.View>
+      </Modal>
       <KeyboardAvoidingView
         style={styles.keyboardView}
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
@@ -683,6 +752,118 @@ const styles = StyleSheet.create({
   loginLink: {
     fontSize: 15,
     color: '#4CAF50',
+    fontWeight: '700',
+  },
+
+  // ── Success Modal ──
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+  successCard: {
+    backgroundColor: '#fff',
+    borderRadius: 28,
+    padding: 32,
+    alignItems: 'center',
+    width: '100%',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 12 },
+    shadowOpacity: 0.2,
+    shadowRadius: 24,
+    elevation: 16,
+  },
+  checkCircleOuter: {
+    width: 100,
+    height: 100,
+    borderRadius: 50,
+    backgroundColor: '#E8F5E9',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 16,
+    borderWidth: 4,
+    borderColor: '#A5D6A7',
+  },
+  checkCircleInner: {
+    width: 76,
+    height: 76,
+    borderRadius: 38,
+    backgroundColor: '#4CAF50',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  dotsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 20,
+  },
+  dot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+  },
+  successTitle: {
+    fontSize: 26,
+    fontWeight: '800',
+    color: '#1a1a1a',
+    marginBottom: 6,
+    letterSpacing: 0.3,
+  },
+  successGreeting: {
+    fontSize: 16,
+    color: '#4CAF50',
+    fontWeight: '600',
+    marginBottom: 12,
+  },
+  successBody: {
+    fontSize: 14,
+    color: '#666',
+    textAlign: 'center',
+    lineHeight: 22,
+    marginBottom: 24,
+  },
+  pillsRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 28,
+  },
+  pill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: '#F1F8E9',
+    borderRadius: 20,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderWidth: 1,
+    borderColor: '#C8E6C9',
+  },
+  pillText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#2E7D32',
+  },
+  successBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#4CAF50',
+    borderRadius: 14,
+    paddingVertical: 16,
+    paddingHorizontal: 32,
+    gap: 10,
+    width: '100%',
+    shadowColor: '#4CAF50',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.35,
+    shadowRadius: 10,
+    elevation: 5,
+  },
+  successBtnText: {
+    color: '#fff',
+    fontSize: 17,
     fontWeight: '700',
   },
 });

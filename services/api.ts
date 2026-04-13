@@ -2,15 +2,15 @@
 import { API_URL } from '../lib/env';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const API_BASE = API_URL || 'http://192.168.12.81:5000';
+const API_BASE = API_URL || 'http://192.168.12.83:5000';
 
 // Helper function to make API requests
 const apiRequest = async (endpoint: string, options: RequestInit = {}) => {
   const token = await AsyncStorage.getItem('userToken');
   
-  const headers: HeadersInit = {
+  const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    ...options.headers,
+    ...(options.headers as Record<string, string>),
   };
 
   if (token) {
@@ -49,14 +49,19 @@ const apiRequest = async (endpoint: string, options: RequestInit = {}) => {
       const error: any = new Error(data.message || 'An error occurred');
       error.code = data.code || 'UNKNOWN_ERROR';
       error.status = response.status;
-      
+
+      // 401 — token is invalid or expired. Clear it so the next app open redirects to login.
+      if (response.status === 401) {
+        AsyncStorage.multiRemove(['userToken', 'userId', 'userName', 'userEmail']).catch(() => {});
+      }
+
       // Log expected errors (like 404) as info, not error
       if (response.status === 404 && data.code === 'EMAIL_NOT_FOUND') {
         console.log(`[API Info] ${options.method || 'GET'} ${API_BASE}${endpoint}: ${error.message}`);
       } else {
         console.error(`[API Error] ${options.method || 'GET'} ${API_BASE}${endpoint}:`, error.message);
       }
-      
+
       throw error;
     }
 
@@ -143,6 +148,68 @@ export const customerAuthAPI = {
     return apiRequest('/api/customer-auth/reset-password', {
       method: 'POST',
       body: JSON.stringify({ token, email, password }),
+    });
+  },
+
+  // Send Email OTP
+  sendEmailOTP: async (email: string) => {
+    return apiRequest('/api/customer-auth/send-email-otp', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+  },
+
+  // Verify Email OTP
+  verifyEmailOTP: async (email: string, otp: string) => {
+    return apiRequest('/api/customer-auth/verify-email-otp', {
+      method: 'POST',
+      body: JSON.stringify({ email, otp }),
+    });
+  },
+};
+
+// Customer Profile API
+export const customerAPI = {
+  // GET /api/customers/me — full profile including stats, createdAt, alternativePhone
+  getProfile: async () => {
+    const token = await AsyncStorage.getItem('userToken');
+    if (!token) throw new Error('Not authenticated');
+    return apiRequest('/api/customers/me');
+  },
+
+  // PUT /api/customers/me — update own profile fields
+  updateProfile: async (data: {
+    name?: string;
+    phone?: string;
+    alternativePhone?: string | null;
+    profilePhoto?: string;
+    address?: {
+      street?: string;
+      city?: string;
+      district?: string;
+      state?: string;
+      pincode?: string;
+    };
+  }) => {
+    return apiRequest('/api/customers/me', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    });
+  },
+
+  // POST /api/customers/me/push-token — register Expo push token
+  savePushToken: async (token: string, platform: string, deviceId?: string) => {
+    return apiRequest('/api/customers/me/push-token', {
+      method: 'POST',
+      body: JSON.stringify({ token, platform, deviceId }),
+    });
+  },
+
+  // POST /api/customers/me/location — update GPS location for proximity queries
+  updateLocation: async (latitude: number, longitude: number, address?: string, city?: string) => {
+    return apiRequest('/api/customers/me/location', {
+      method: 'POST',
+      body: JSON.stringify({ latitude, longitude, address, city }),
     });
   },
 };

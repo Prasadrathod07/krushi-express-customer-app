@@ -23,7 +23,7 @@ export default function Settings() {
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [showLanguageModal, setShowLanguageModal] = useState(false);
 
-  const handleLanguageSelect = async (lang: 'en' | 'mr' | 'hi') => {
+  const handleLanguageSelect = async (lang: 'en' | 'mr') => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     await setLanguage(lang);
     setShowLanguageModal(false);
@@ -137,12 +137,12 @@ export default function Settings() {
                 {item.type === 'switch' ? (
                   <Switch
                     value={item.value as boolean}
-                    onValueChange={item.onToggle}
+                    onValueChange={(item as any).onToggle}
                     trackColor={{ false: '#ddd', true: '#4CAF50' }}
                     thumbColor="#fff"
                   />
                 ) : (
-                  <TouchableOpacity onPress={item.onPress}>
+                  <TouchableOpacity onPress={(item as any).onPress}>
                     <View style={styles.settingRight}>
                       {item.value && (
                         <Text style={styles.settingValue}>{item.value}</Text>
@@ -176,7 +176,7 @@ export default function Settings() {
               </TouchableOpacity>
             </View>
             <View style={styles.languageList}>
-              {(['en', 'mr', 'hi'] as const).map((lang) => (
+              {(['en', 'mr'] as const).map((lang) => (
                 <TouchableOpacity
                   key={lang}
                   style={[

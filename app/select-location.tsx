@@ -10,48 +10,65 @@ import {
   Alert,
   FlatList,
   Keyboard,
+  Animated,
+  Platform,
 } from 'react-native';
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import { useState, useEffect, useRef } from 'react';
+import React from 'react';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import * as Haptics from 'expo-haptics';
 import * as Location from 'expo-location';
 import MapView, { Marker, PROVIDER_GOOGLE } from 'react-native-maps';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { placesAPI, PlaceSuggestion } from '../services/placesAPI';
+
+const PICKUP_COLOR = '#2E7D32';
+const DROP_COLOR   = '#E65100';
 
 export default function SelectLocation() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
   const params = useLocalSearchParams();
   const locationType = (params.type as string) || 'pickup';
-  
-  const [searchQuery, setSearchQuery] = useState('');
-  const [suggestions, setSuggestions] = useState<PlaceSuggestion[]>([]);
+  const isPickup = locationType === 'pickup';
+  const accentColor = isPickup ? PICKUP_COLOR : DROP_COLOR;
+  const accentLight = isPickup ? '#E8F5E9' : '#FFF3E0';
+
+  const [searchQuery, setSearchQuery]       = useState('');
+  const [suggestions, setSuggestions]       = useState<PlaceSuggestion[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [selectedLocation, setSelectedLocation] = useState<{
-    latitude: number;
-    longitude: number;
-    address: string;
+    latitude: number; longitude: number; address: string;
   } | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [searching, setSearching] = useState(false);
+  const [loading, setLoading]             = useState(false);
+  const [searching, setSearching]         = useState(false);
   const [currentLocation, setCurrentLocation] = useState<{
-    latitude: number;
-    longitude: number;
+    latitude: number; longitude: number;
   } | null>(null);
-  
-  const mapRef = useRef<MapView>(null);
-  const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [inputFocused, setInputFocused]   = useState(false);
+
+  const mapRef             = useRef<MapView>(null);
+  const searchTimeoutRef   = useRef<NodeJS.Timeout | null>(null);
+  const inputRef           = useRef<TextInput>(null);
+  const suggestionAnim     = useRef(new Animated.Value(0)).current;
+  // When true, the next searchQuery change came from code (not user typing) — skip search
+  const suppressSearchRef  = useRef(false);
+
+  // ── animate suggestions in/out ──────────────────────────────────────────────
+  useEffect(() => {
+    Animated.timing(suggestionAnim, {
+      toValue: showSuggestions ? 1 : 0,
+      duration: 180,
+      useNativeDriver: true,
+    }).start();
+  }, [showSuggestions]);
 
   useEffect(() => {
     requestLocationPermission();
     loadStoredLocation();
-    
-    return () => {
-      if (searchTimeoutRef.current) {
-        clearTimeout(searchTimeoutRef.current);
-      }
-    };
+    return () => { if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current); };
   }, []);
 
   useEffect(() => {
@@ -64,534 +81,410 @@ export default function SelectLocation() {
     }
   }, [selectedLocation]);
 
-  // Debounced search for autocomplete
+  // ── debounced search ─────────────────────────────────────────────────────────
   useEffect(() => {
-    if (searchTimeoutRef.current) {
-      clearTimeout(searchTimeoutRef.current);
+    // Query was set programmatically (selection / map tap / GPS) — don't re-search
+    if (suppressSearchRef.current) {
+      suppressSearchRef.current = false;
+      return;
     }
-
-    const trimmedQuery = searchQuery.trim();
-    
-    if (trimmedQuery.length >= 2) {
-      // User is typing - clear selected location to allow new search
-      if (selectedLocation && selectedLocation.address !== trimmedQuery) {
-        // Don't clear if it's the same as current selection
-        // This allows user to edit the address
-      }
-      
+    if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
+    const q = searchQuery.trim();
+    if (q.length >= 2) {
       setSearching(true);
       setShowSuggestions(true);
-      
-      searchTimeoutRef.current = setTimeout(() => {
-        handleAutocompleteSearch(trimmedQuery);
-      }, 300); // 300ms debounce
-    } else if (trimmedQuery.length === 0) {
-      // Search cleared - hide suggestions but keep selected location
-      setSuggestions([]);
-      setShowSuggestions(false);
-      setSearching(false);
+      searchTimeoutRef.current = setTimeout(() => handleAutocompleteSearch(q), 300);
+    } else if (q.length === 0) {
+      setSuggestions([]); setShowSuggestions(false); setSearching(false);
     } else {
-      // 1 character - show suggestions container but wait for more input
-      setSuggestions([]);
-      setShowSuggestions(false);
-      setSearching(false);
+      setSuggestions([]); setShowSuggestions(false); setSearching(false);
     }
-
-    return () => {
-      if (searchTimeoutRef.current) {
-        clearTimeout(searchTimeoutRef.current);
-      }
-    };
+    return () => { if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current); };
   }, [searchQuery]);
+
+  // Wraps reverseGeocodeAsync so Android "hbcc: UNAVAILABLE" and other
+  // transient geocoding failures never crash the flow — returns null on error.
+  const safeReverseGeocode = async (coords: { latitude: number; longitude: number }) => {
+    try {
+      const results = await Location.reverseGeocodeAsync(coords);
+      return results?.[0] ?? null;
+    } catch (e) {
+      console.warn('Reverse geocode unavailable, using coordinates as fallback:', e);
+      return null;
+    }
+  };
 
   const requestLocationPermission = async () => {
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission Denied', 'Location permission is required.');
-        return;
-      }
-
-      const location = await Location.getCurrentPositionAsync({});
-      const coords = {
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude,
-      };
+      if (status !== 'granted') { Alert.alert('Permission Denied', 'Location permission is required.'); return; }
+      const loc = await Location.getCurrentPositionAsync({});
+      const coords = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
       setCurrentLocation(coords);
-
-      // Only auto-set location if no stored location exists AND search query is empty
-      if (!selectedLocation && !searchQuery) {
-        const [address] = await Location.reverseGeocodeAsync(coords);
-        if (address) {
-          const addressString = `${address.street || ''} ${address.city || ''} ${address.region || ''}`.trim();
-          setSelectedLocation({
-            ...coords,
-            address: addressString || 'Current Location',
-          });
-          // Don't set searchQuery here - let user type to search
-        }
-      }
-
-      if (mapRef.current) {
-        mapRef.current.animateToRegion({
-          ...coords,
-          latitudeDelta: 0.05,
-          longitudeDelta: 0.05,
-        }, 1000);
-      }
-    } catch (error) {
-      console.error('Error getting location:', error);
-    }
+      // Only center the map — do NOT auto-select current location as the pickup/drop point
+      mapRef.current?.animateToRegion({ ...coords, latitudeDelta: 0.05, longitudeDelta: 0.05 }, 1000);
+    } catch (e) { console.error('Location error:', e); }
   };
 
   const loadStoredLocation = async () => {
     try {
-      const key = locationType === 'pickup' ? 'pickupLocation' : 'dropLocation';
+      const key = isPickup ? 'pickupLocation' : 'dropLocation';
       const stored = await AsyncStorage.getItem(key);
       if (stored) {
-        const location = JSON.parse(stored);
-        setSelectedLocation(location);
-        // Set search query but don't prevent user from searching
-        setSearchQuery(location.address);
+        const loc = JSON.parse(stored);
+        setSelectedLocation(loc);
+        suppressSearchRef.current = true;
+        setSearchQuery(loc.address);
       }
-    } catch (error) {
-      console.error('Error loading stored location:', error);
-    }
+    } catch (e) { console.error('Load stored error:', e); }
   };
 
   const handleAutocompleteSearch = async (query: string) => {
-    if (!query || query.trim().length < 2) {
-      setSuggestions([]);
-      setSearching(false);
-      return;
-    }
-
+    if (!query || query.trim().length < 2) { setSuggestions([]); setSearching(false); return; }
     try {
-      console.log('🔍 Searching for:', query);
-      const response = await placesAPI.getAutocomplete(
-        query.trim(),
-        currentLocation || undefined,
-        50000 // 50km radius
-      );
-
-      console.log('📥 Autocomplete response:', response);
-      
+      const response = await placesAPI.getAutocomplete(query.trim(), currentLocation || undefined, 50000);
       if (response.ok && response.data && Array.isArray(response.data)) {
-        console.log(`✅ Found ${response.data.length} suggestions`);
-        setSuggestions(response.data);
-        setShowSuggestions(true);
+        setSuggestions(response.data); setShowSuggestions(true);
       } else {
-        console.log('⚠️  No suggestions in response');
         setSuggestions([]);
       }
-    } catch (error) {
-      console.error('❌ Error fetching autocomplete:', error);
-      // Fallback to expo-location geocoding
+    } catch {
       try {
         const results = await Location.geocodeAsync(query);
         if (results.length > 0) {
-          const result = results[0];
-          setSuggestions([{
-            placeId: `geocode_${result.latitude}_${result.longitude}`,
-            description: query,
-            mainText: query,
-            secondaryText: '',
-            isMaharashtra: false,
-            types: [],
-          }]);
+          const r = results[0];
+          setSuggestions([{ placeId: `geocode_${r.latitude}_${r.longitude}`, description: query, mainText: query, secondaryText: '', isMaharashtra: false, types: [] }]);
           setShowSuggestions(true);
-        } else {
-          setSuggestions([]);
-        }
-      } catch (geocodeError) {
-        console.error('❌ Geocoding fallback error:', geocodeError);
-        setSuggestions([]);
-      }
-    } finally {
-      setSearching(false);
-    }
+        } else { setSuggestions([]); }
+      } catch { setSuggestions([]); }
+    } finally { setSearching(false); }
   };
 
   const handleSelectSuggestion = async (suggestion: PlaceSuggestion) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    // Suppress the searchQuery effect so setting the query doesn't re-open suggestions
+    suppressSearchRef.current = true;
     setSearchQuery(suggestion.description);
+    setSuggestions([]);
     setShowSuggestions(false);
+    setSearching(false);
     Keyboard.dismiss();
     setLoading(true);
-
     try {
-      // Get place details
       if (suggestion.placeId.startsWith('geocode_')) {
-        // Handle geocoded result
         const [lat, lng] = suggestion.placeId.replace('geocode_', '').split('_');
-        const location = {
-          latitude: parseFloat(lat),
-          longitude: parseFloat(lng),
-          address: suggestion.description,
-        };
-        setSelectedLocation(location);
+        const loc = { latitude: parseFloat(lat), longitude: parseFloat(lng), address: suggestion.description };
+        setSelectedLocation(loc);
+        mapRef.current?.animateToRegion({ ...loc, latitudeDelta: 0.01, longitudeDelta: 0.01 }, 800);
       } else {
         const response = await placesAPI.getPlaceDetails(suggestion.placeId);
         if (response.ok && response.data) {
-          const location = {
-            latitude: response.data.latitude,
-            longitude: response.data.longitude,
-            address: response.data.address,
-          };
-          setSelectedLocation(location);
-
-          if (mapRef.current) {
-            mapRef.current.animateToRegion({
-              latitude: location.latitude,
-              longitude: location.longitude,
-              latitudeDelta: 0.01,
-              longitudeDelta: 0.01,
-            }, 1000);
-          }
+          const loc = { latitude: response.data.latitude, longitude: response.data.longitude, address: response.data.address };
+          setSelectedLocation(loc);
+          mapRef.current?.animateToRegion({ ...loc, latitudeDelta: 0.01, longitudeDelta: 0.01 }, 800);
         }
       }
-    } catch (error) {
-      console.error('Error getting place details:', error);
-      Alert.alert('Error', 'Failed to get location details. Please try again.');
-    } finally {
-      setLoading(false);
-    }
+    } catch { Alert.alert('Error', 'Failed to get location details. Please try again.'); }
+    finally { setLoading(false); }
   };
 
   const handleMapPress = async (e: any) => {
     const { latitude, longitude } = e.nativeEvent.coordinate;
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    
-    setLoading(true);
-    setShowSuggestions(false);
-    Keyboard.dismiss();
-    
+    setLoading(true); setSuggestions([]); setShowSuggestions(false); setSearching(false); Keyboard.dismiss();
     try {
-      const [address] = await Location.reverseGeocodeAsync({ latitude, longitude });
-      const addressString = address
-        ? `${address.street || ''} ${address.city || ''} ${address.region || ''}`.trim()
-        : `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`;
-      
-      setSelectedLocation({
-        latitude,
-        longitude,
-        address: addressString,
-      });
+      const addr = await safeReverseGeocode({ latitude, longitude });
+      const addressString = addr
+        ? `${addr.street || ''} ${addr.city || ''} ${addr.region || ''}`.trim() || `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`
+        : `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+      setSelectedLocation({ latitude, longitude, address: addressString });
+      suppressSearchRef.current = true;
       setSearchQuery(addressString);
-    } catch (error) {
-      console.error('Error getting address:', error);
-      setSelectedLocation({
-        latitude,
-        longitude,
-        address: `${latitude.toFixed(6)}, ${longitude.toFixed(6)}`,
-      });
-    } finally {
-      setLoading(false);
-    }
+      mapRef.current?.animateToRegion({ latitude, longitude, latitudeDelta: 0.01, longitudeDelta: 0.01 }, 600);
+    } finally { setLoading(false); }
   };
 
   const handleUseCurrentLocation = async () => {
-    if (!currentLocation) {
-      await requestLocationPermission();
-      return;
-    }
-
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    setLoading(true);
-    setShowSuggestions(false);
-    Keyboard.dismiss();
-
+    if (!currentLocation) { await requestLocationPermission(); return; }
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    setLoading(true); setSuggestions([]); setShowSuggestions(false); setSearching(false); Keyboard.dismiss();
     try {
-      const [address] = await Location.reverseGeocodeAsync(currentLocation);
-      const addressString = address
-        ? `${address.street || ''} ${address.city || ''} ${address.region || ''}`.trim()
+      const addr = await safeReverseGeocode(currentLocation);
+      const addressString = addr
+        ? `${addr.street || ''} ${addr.city || ''} ${addr.region || ''}`.trim() || 'Current Location'
         : 'Current Location';
-      
-      setSelectedLocation({
-        ...currentLocation,
-        address: addressString,
-      });
+      setSelectedLocation({ ...currentLocation, address: addressString });
+      suppressSearchRef.current = true;
       setSearchQuery(addressString);
-
-      if (mapRef.current) {
-        mapRef.current.animateToRegion({
-          ...currentLocation,
-          latitudeDelta: 0.05,
-          longitudeDelta: 0.05,
-        }, 1000);
-      }
-    } catch (error) {
-      console.error('Error getting current location address:', error);
-    } finally {
-      setLoading(false);
-    }
+      mapRef.current?.animateToRegion({ ...currentLocation, latitudeDelta: 0.015, longitudeDelta: 0.015 }, 800);
+    } finally { setLoading(false); }
   };
 
   const handleConfirm = async () => {
-    if (!selectedLocation) {
-      Alert.alert('Required', 'Please select a location on the map.');
-      return;
-    }
-
+    if (!selectedLocation) { Alert.alert('Required', 'Please select a location.'); return; }
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    
-    const key = locationType === 'pickup' ? 'pickupLocation' : 'dropLocation';
+    const key = isPickup ? 'pickupLocation' : 'dropLocation';
     await AsyncStorage.setItem(key, JSON.stringify(selectedLocation));
-
-    // If drop location is confirmed, check if both locations are set
-    if (locationType === 'drop') {
-      console.log('🔍 Drop location confirmed, checking for pickup location...');
+    if (!isPickup) {
       try {
         const pickupStored = await AsyncStorage.getItem('pickupLocation');
-        console.log('📦 Pickup stored:', pickupStored ? 'Found' : 'Not found');
-        
         if (pickupStored) {
-          const pickupLocation = JSON.parse(pickupStored);
-          console.log('📍 Pickup location:', pickupLocation);
-          console.log('📍 Drop location:', selectedLocation);
-          
-          // Validate both locations have coordinates
-          const hasPickupCoords = pickupLocation.latitude && pickupLocation.longitude;
-          const hasDropCoords = selectedLocation.latitude && selectedLocation.longitude;
-          
-          console.log('✅ Pickup coords valid:', hasPickupCoords);
-          console.log('✅ Drop coords valid:', hasDropCoords);
-          
-          if (hasPickupCoords && hasDropCoords) {
-            // Both locations are set and valid - navigate directly to step 2
-            console.log('✅✅ Both locations confirmed, navigating to step 2');
-            
-            // Navigate immediately (no setTimeout needed)
+          const pickup = JSON.parse(pickupStored);
+          if (pickup.latitude && pickup.longitude && selectedLocation.latitude && selectedLocation.longitude) {
             router.push({
               pathname: '/book-ride',
               params: {
                 step: '2',
-                pickupLat: pickupLocation.latitude.toString(),
-                pickupLng: pickupLocation.longitude.toString(),
-                pickupAddress: pickupLocation.address || 'Pickup Location',
-                dropLat: selectedLocation.latitude.toString(),
-                dropLng: selectedLocation.longitude.toString(),
-                dropAddress: selectedLocation.address || 'Drop Location',
+                pickupLat: pickup.latitude.toString(), pickupLng: pickup.longitude.toString(), pickupAddress: pickup.address || 'Pickup Location',
+                dropLat: selectedLocation.latitude.toString(), dropLng: selectedLocation.longitude.toString(), dropAddress: selectedLocation.address || 'Drop Location',
               },
             });
             return;
-          } else {
-            console.log('⚠️ Locations missing coordinates - Pickup:', hasPickupCoords, 'Drop:', hasDropCoords);
           }
-        } else {
-          console.log('⚠️ Pickup location not found in storage');
         }
-      } catch (error) {
-        console.error('❌ Error checking locations:', error);
-      }
-    } else {
-      console.log('📍 Pickup location confirmed, returning to home');
+      } catch (e) { console.error('Confirm error:', e); }
     }
-
-    // Default: go back to home (for pickup location or if drop location check fails)
     router.back();
   };
 
-  return (
-    <SafeAreaView style={styles.safeArea}>
-      <StatusBar barStyle="dark-content" backgroundColor="#fff" />
-      
-      {/* Header */}
-      <View style={styles.header}>
-        <TouchableOpacity
-          onPress={() => {
-            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-            router.back();
-          }}
-          style={styles.backButton}
-        >
-          <Icon name="arrow-back" size={24} color="#1a1a1a" />
-        </TouchableOpacity>
-        <Text style={styles.headerTitle}>
-          Select {locationType === 'pickup' ? 'Pickup' : 'Drop'} Location
-        </Text>
-        <View style={styles.backButton} />
+  // ── render suggestion item ───────────────────────────────────────────────────
+  const renderSuggestion = ({ item, index }: { item: PlaceSuggestion; index: number }) => (
+    <TouchableOpacity
+      style={styles.suggCard}
+      onPress={() => handleSelectSuggestion(item)}
+      activeOpacity={0.65}
+    >
+      <View style={[styles.suggIconBox, item.isMaharashtra ? { backgroundColor: accentLight } : styles.suggIconBoxDefault]}>
+        <Icon
+          name={item.types?.includes('establishment') ? 'store' : item.isMaharashtra ? 'location-city' : 'place'}
+          size={18}
+          color={item.isMaharashtra ? accentColor : '#888'}
+        />
       </View>
+      <View style={styles.suggBody}>
+        <Text style={styles.suggMain} numberOfLines={1}>{item.mainText}</Text>
+        {!!item.secondaryText && (
+          <Text style={styles.suggSub} numberOfLines={1}>{item.secondaryText}</Text>
+        )}
+      </View>
+      <View style={styles.suggRight}>
+        {item.isMaharashtra && (
+          <View style={[styles.mhBadge, { backgroundColor: accentLight }]}>
+            <Text style={[styles.mhBadgeText, { color: accentColor }]}>MH</Text>
+          </View>
+        )}
+        <Icon name="chevron-right" size={16} color="#ccc" />
+      </View>
+    </TouchableOpacity>
+  );
 
-      {/* Search Bar */}
-      <View style={styles.searchContainer}>
-        <View style={styles.searchBar}>
-          <Icon name="search" size={24} color="#666" />
+  return (
+    <SafeAreaView style={[styles.safe, { paddingTop: insets.top }]}>
+      <StatusBar barStyle="light-content" backgroundColor={accentColor} />
+
+      {/* ── Header ─────────────────────────────────────────── */}
+      <View style={[styles.header, { backgroundColor: accentColor }]}>
+        {/* decorative circle */}
+        <View style={styles.headerCircle} />
+        <View style={styles.headerRow}>
+          <TouchableOpacity
+            style={styles.backBtn}
+            onPress={() => { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); router.back(); }}
+          >
+            <Icon name="arrow-back" size={22} color="#fff" />
+          </TouchableOpacity>
+          <View style={styles.headerCenter}>
+            <View style={[styles.typeDot, { backgroundColor: 'rgba(255,255,255,0.35)' }]}>
+              <Icon name={isPickup ? 'trip-origin' : 'place'} size={14} color="#fff" />
+            </View>
+            <Text style={styles.headerTitle}>
+              {isPickup ? 'Pickup Location' : 'Drop Location'}
+            </Text>
+          </View>
+        </View>
+
+        {/* ── Search bar lives inside header card ───────── */}
+        <View style={[styles.searchCard, inputFocused && styles.searchCardFocused]}>
+          <Icon name="search" size={20} color={inputFocused ? accentColor : '#aaa'} />
           <TextInput
+            ref={inputRef}
             style={styles.searchInput}
-            placeholder="Search city, village, or place..."
-            placeholderTextColor="#999"
+            placeholder={`Search ${isPickup ? 'pickup' : 'drop'} address…`}
+            placeholderTextColor="#bbb"
             value={searchQuery}
             onChangeText={setSearchQuery}
-            returnKeyType="search"
             onFocus={() => {
-              // Always show suggestions when focused if there are any
-              if (suggestions.length > 0) {
-                setShowSuggestions(true);
-              } else if (searchQuery.length >= 2) {
-                // If user has typed 2+ chars, trigger search
-                handleAutocompleteSearch(searchQuery);
-                setShowSuggestions(true);
-              }
+              setInputFocused(true);
+              if (suggestions.length > 0) setShowSuggestions(true);
+              else if (searchQuery.length >= 2) { handleAutocompleteSearch(searchQuery); setShowSuggestions(true); }
             }}
-            onBlur={() => {
-              // Don't hide suggestions immediately on blur - let user select
-              // Suggestions will hide when user selects one
-            }}
+            onBlur={() => setInputFocused(false)}
+            returnKeyType="search"
+            autoCorrect={false}
           />
-          {searching && (
-            <ActivityIndicator size="small" color="#4CAF50" style={styles.searchLoader} />
-          )}
-          {searchQuery.length > 0 && !searching && (
-            <TouchableOpacity
-              onPress={() => {
-                setSearchQuery('');
-                setSuggestions([]);
-                setShowSuggestions(false);
-                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-              }}
-            >
-              <Icon name="close" size={20} color="#666" />
-            </TouchableOpacity>
-          )}
-        </View>
-        <TouchableOpacity
-          style={styles.currentLocationButton}
-          onPress={handleUseCurrentLocation}
-        >
-          <Icon name="my-location" size={20} color="#4CAF50" />
-        </TouchableOpacity>
-      </View>
-
-      {/* Autocomplete Suggestions */}
-      {showSuggestions && (
-        <View style={styles.suggestionsContainer}>
           {searching ? (
-            <View style={styles.suggestionItem}>
-              <ActivityIndicator size="small" color="#4CAF50" />
-              <Text style={[styles.suggestionMainText, { marginLeft: 12 }]}>Searching...</Text>
-            </View>
-          ) : suggestions.length > 0 ? (
-            <FlatList
-              data={suggestions}
-              keyExtractor={(item) => item.placeId}
-              renderItem={({ item }) => (
-                <TouchableOpacity
-                  style={styles.suggestionItem}
-                  onPress={() => handleSelectSuggestion(item)}
-                  activeOpacity={0.7}
-                >
-                  <View style={styles.suggestionIcon}>
-                    <Icon
-                      name={item.isMaharashtra ? 'location-city' : 'place'}
-                      size={20}
-                      color={item.isMaharashtra ? '#4CAF50' : '#666'}
-                    />
-                  </View>
-                  <View style={styles.suggestionText}>
-                    <Text style={styles.suggestionMainText}>{item.mainText}</Text>
-                    {item.secondaryText && (
-                      <Text style={styles.suggestionSecondaryText} numberOfLines={1}>
-                        {item.secondaryText}
-                      </Text>
-                    )}
-                  </View>
-                  {item.isMaharashtra && (
-                    <View style={styles.maharashtraBadge}>
-                      <Text style={styles.maharashtraBadgeText}>MH</Text>
-                    </View>
-                  )}
-                </TouchableOpacity>
-              )}
-              keyboardShouldPersistTaps="handled"
-              style={styles.suggestionsList}
-            />
-          ) : searchQuery.length >= 2 ? (
-            <View style={styles.suggestionItem}>
-              <Text style={styles.suggestionMainText}>No results found</Text>
-              <Text style={styles.suggestionSecondaryText}>Try a different search term</Text>
-            </View>
+            <ActivityIndicator size="small" color={accentColor} />
+          ) : searchQuery.length > 0 ? (
+            <TouchableOpacity onPress={() => { setSearchQuery(''); setSuggestions([]); setShowSuggestions(false); inputRef.current?.focus(); }}>
+              <View style={styles.clearBtn}>
+                <Icon name="close" size={14} color="#666" />
+              </View>
+            </TouchableOpacity>
           ) : null}
         </View>
+      </View>
+
+      {/* ── Suggestions panel ──────────────────────────────── */}
+      {showSuggestions && (
+        <Animated.View
+          style={[
+            styles.suggestionsPanel,
+            { opacity: suggestionAnim, transform: [{ translateY: suggestionAnim.interpolate({ inputRange: [0, 1], outputRange: [-8, 0] }) }] },
+          ]}
+        >
+          {/* Use current location row */}
+          <TouchableOpacity style={styles.currentLocRow} onPress={handleUseCurrentLocation} activeOpacity={0.7}>
+            <View style={[styles.currentLocIcon, { backgroundColor: accentLight }]}>
+              <Icon name="my-location" size={18} color={accentColor} />
+            </View>
+            <View style={styles.suggBody}>
+              <Text style={[styles.suggMain, { color: accentColor }]}>Use my current location</Text>
+              <Text style={styles.suggSub}>GPS · Auto-detect</Text>
+            </View>
+            <Icon name="chevron-right" size={16} color={accentColor} />
+          </TouchableOpacity>
+
+          <View style={styles.divider} />
+
+          {searching ? (
+            <View style={styles.searchingRow}>
+              <ActivityIndicator size="small" color={accentColor} />
+              <Text style={styles.searchingText}>Searching places…</Text>
+            </View>
+          ) : suggestions.length > 0 ? (
+            <>
+              <View style={styles.sectionLabel}>
+                <Icon name="place" size={12} color="#bbb" />
+                <Text style={styles.sectionLabelText}>SUGGESTIONS</Text>
+              </View>
+              <FlatList
+                data={suggestions}
+                keyExtractor={(item) => item.placeId}
+                renderItem={renderSuggestion}
+                keyboardShouldPersistTaps="handled"
+                style={styles.suggList}
+                showsVerticalScrollIndicator={false}
+                ItemSeparatorComponent={() => <View style={styles.itemSep} />}
+              />
+            </>
+          ) : searchQuery.length >= 2 ? (
+            <View style={styles.emptyRow}>
+              <Icon name="search-off" size={28} color="#ddd" />
+              <Text style={styles.emptyTitle}>No results found</Text>
+              <Text style={styles.emptySub}>Try a different name or pin on the map</Text>
+            </View>
+          ) : null}
+        </Animated.View>
       )}
 
-      {/* Map */}
-      <View style={styles.mapContainer}>
+      {/* ── Map ────────────────────────────────────────────── */}
+      <View style={styles.mapWrap}>
         {currentLocation ? (
           <MapView
             ref={mapRef}
             provider={PROVIDER_GOOGLE}
             style={styles.map}
-            initialRegion={{
-              latitude: currentLocation.latitude,
-              longitude: currentLocation.longitude,
-              latitudeDelta: 0.05,
-              longitudeDelta: 0.05,
-            }}
+            initialRegion={{ ...currentLocation, latitudeDelta: 0.05, longitudeDelta: 0.05 }}
             onPress={handleMapPress}
-            showsUserLocation={true}
+            showsUserLocation
             showsMyLocationButton={false}
             mapType="standard"
           >
             {selectedLocation && (
               <Marker
-                coordinate={{
-                  latitude: selectedLocation.latitude,
-                  longitude: selectedLocation.longitude,
-                }}
+                coordinate={{ latitude: selectedLocation.latitude, longitude: selectedLocation.longitude }}
                 title={selectedLocation.address}
-                pinColor={locationType === 'pickup' ? '#4CAF50' : '#FF9800'}
+                pinColor={isPickup ? '#2E7D32' : '#E65100'}
               />
             )}
           </MapView>
         ) : (
           <View style={styles.mapPlaceholder}>
-            <ActivityIndicator size="large" color="#4CAF50" />
-            <Text style={styles.mapPlaceholderText}>Loading map...</Text>
+            <ActivityIndicator size="large" color={accentColor} />
+            <Text style={styles.mapPlaceholderText}>Loading map…</Text>
           </View>
         )}
 
+        {/* tap-map hint */}
+        {!showSuggestions && !selectedLocation && (
+          <View style={styles.mapHint}>
+            <Icon name="touch-app" size={14} color="#fff" />
+            <Text style={styles.mapHintText}>Tap map to pin a location</Text>
+          </View>
+        )}
+
+        {/* location loading overlay */}
         {loading && (
           <View style={styles.loadingOverlay}>
-            <ActivityIndicator size="small" color="#4CAF50" />
+            <View style={styles.loadingCard}>
+              <ActivityIndicator size="small" color={accentColor} />
+              <Text style={[styles.loadingText, { color: accentColor }]}>Getting location…</Text>
+            </View>
           </View>
+        )}
+
+        {/* current location FAB (shown when suggestions closed) */}
+        {!showSuggestions && (
+          <TouchableOpacity
+            style={[styles.myLocFab, { backgroundColor: accentColor }]}
+            onPress={handleUseCurrentLocation}
+          >
+            <Icon name="my-location" size={20} color="#fff" />
+          </TouchableOpacity>
         )}
       </View>
 
-      {/* Selected Location Card */}
-      {selectedLocation && (
-        <View style={styles.locationCard}>
-          <View style={styles.locationIcon}>
-            <Icon
-              name={locationType === 'pickup' ? 'location-on' : 'place'}
-              size={24}
-              color={locationType === 'pickup' ? '#4CAF50' : '#FF9800'}
-            />
+      {/* ── Bottom sheet: selected location + confirm ──────── */}
+      <View style={[styles.bottom, { paddingBottom: insets.bottom + 8 }]}>
+        {selectedLocation ? (
+          <View style={[styles.selectedCard, { borderLeftColor: accentColor }]}>
+            <View style={[styles.selectedIconBox, { backgroundColor: accentLight }]}>
+              <Icon name={isPickup ? 'trip-origin' : 'place'} size={20} color={accentColor} />
+            </View>
+            <View style={styles.selectedBody}>
+              <Text style={[styles.selectedLabel, { color: accentColor }]}>
+                {isPickup ? 'PICKUP' : 'DROP'} POINT
+              </Text>
+              <Text style={styles.selectedAddr} numberOfLines={2}>{selectedLocation.address}</Text>
+            </View>
+            <TouchableOpacity
+              style={styles.editBtn}
+              onPress={() => { setSearchQuery(''); setSuggestions([]); setShowSuggestions(false); setTimeout(() => inputRef.current?.focus(), 100); }}
+            >
+              <Icon name="edit" size={16} color={accentColor} />
+            </TouchableOpacity>
           </View>
-          <View style={styles.locationInfo}>
-            <Text style={styles.locationLabel}>
-              {locationType === 'pickup' ? 'Pickup' : 'Drop'} Location
-            </Text>
-            <Text style={styles.locationAddress} numberOfLines={2}>
-              {selectedLocation.address}
-            </Text>
+        ) : (
+          <View style={styles.noSelectionHint}>
+            <Icon name="info-outline" size={15} color="#bbb" />
+            <Text style={styles.noSelectionText}>Search above or tap the map to select a location</Text>
           </View>
-        </View>
-      )}
+        )}
 
-      {/* Confirm Button */}
-      <View style={styles.footer}>
         <TouchableOpacity
-          style={[styles.confirmButton, !selectedLocation && styles.confirmButtonDisabled]}
+          style={[styles.confirmBtn, { backgroundColor: selectedLocation ? accentColor : '#ccc' }]}
           onPress={handleConfirm}
           disabled={!selectedLocation || loading}
+          activeOpacity={0.85}
         >
           {loading ? (
             <ActivityIndicator color="#fff" />
           ) : (
             <>
-              <Text style={styles.confirmButtonText}>Confirm Location</Text>
-              <Icon name="check" size={20} color="#fff" />
+              <Icon name={isPickup ? 'check-circle' : 'flag'} size={20} color="#fff" />
+              <Text style={styles.confirmText}>
+                {isPickup ? 'Confirm Pickup' : 'Confirm Drop Point'}
+              </Text>
             </>
           )}
         </TouchableOpacity>
@@ -601,204 +494,78 @@ export default function SelectLocation() {
 }
 
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: '#fff',
-  },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    padding: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f0f0f0',
-  },
-  backButton: {
-    width: 40,
-    height: 40,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  headerTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#1a1a1a',
-  },
-  searchContainer: {
-    flexDirection: 'row',
-    padding: 16,
-    gap: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f0f0f0',
-  },
-  searchBar: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#f5f5f5',
-    borderRadius: 12,
-    paddingHorizontal: 16,
-    gap: 12,
-  },
-  searchInput: {
-    flex: 1,
-    paddingVertical: 12,
-    fontSize: 16,
-    color: '#1a1a1a',
-  },
-  searchLoader: {
-    marginLeft: 8,
-  },
-  currentLocationButton: {
-    width: 48,
-    height: 48,
-    borderRadius: 12,
-    backgroundColor: '#E8F5E9',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  suggestionsContainer: {
-    maxHeight: 300,
-    backgroundColor: '#fff',
-    borderBottomWidth: 1,
-    borderBottomColor: '#f0f0f0',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 4,
-  },
-  suggestionsList: {
-    flexGrow: 0,
-  },
-  suggestionItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    padding: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f5f5f5',
-  },
-  suggestionIcon: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: '#f5f5f5',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 12,
-  },
-  suggestionText: {
-    flex: 1,
-  },
-  suggestionMainText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#1a1a1a',
-    marginBottom: 2,
-  },
-  suggestionSecondaryText: {
-    fontSize: 14,
-    color: '#666',
-  },
-  maharashtraBadge: {
-    backgroundColor: '#E8F5E9',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 8,
-    marginLeft: 8,
-  },
-  maharashtraBadgeText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#4CAF50',
-  },
-  mapContainer: {
-    flex: 1,
-    position: 'relative',
-  },
-  map: {
-    width: '100%',
-    height: '100%',
-  },
-  mapPlaceholder: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: '#f5f5f5',
-  },
-  mapPlaceholderText: {
-    fontSize: 16,
-    color: '#666',
-    marginTop: 12,
-  },
-  loadingOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.8)',
-  },
-  locationCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#fff',
-    padding: 16,
-    margin: 16,
-    borderRadius: 16,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 4,
-  },
-  locationIcon: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    backgroundColor: '#E8F5E9',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 16,
-  },
-  locationInfo: {
-    flex: 1,
-  },
-  locationLabel: {
-    fontSize: 12,
-    color: '#999',
-    marginBottom: 4,
-    textTransform: 'uppercase',
-    fontWeight: '600',
-  },
-  locationAddress: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#1a1a1a',
-  },
-  footer: {
-    padding: 16,
-    borderTopWidth: 1,
-    borderTopColor: '#f0f0f0',
-    backgroundColor: '#fff',
-  },
-  confirmButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#4CAF50',
-    borderRadius: 16,
-    padding: 18,
-    gap: 8,
-  },
-  confirmButtonDisabled: {
-    opacity: 0.5,
-  },
-  confirmButtonText: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#fff',
-  },
+  safe: { flex: 1, backgroundColor: '#F4F6F9' },
+
+  // ── Header ──────────────────────────────────────────────────
+  header: { paddingHorizontal: 16, paddingBottom: 14, overflow: 'hidden' },
+  headerCircle: { position: 'absolute', width: 200, height: 200, borderRadius: 100, backgroundColor: 'rgba(255,255,255,0.07)', top: -80, right: -50 },
+  headerRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 14, marginTop: 6 },
+  backBtn: { width: 38, height: 38, borderRadius: 19, backgroundColor: 'rgba(255,255,255,0.2)', justifyContent: 'center', alignItems: 'center' },
+  headerCenter: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  typeDot: { width: 28, height: 28, borderRadius: 14, justifyContent: 'center', alignItems: 'center' },
+  headerTitle: { fontSize: 20, fontWeight: '800', color: '#fff' },
+
+  // ── Search card (inside header) ──────────────────────────────
+  searchCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#fff', borderRadius: 14, paddingHorizontal: 14, paddingVertical: Platform.OS === 'ios' ? 12 : 4, gap: 10, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.12, shadowRadius: 10, elevation: 6 },
+  searchCardFocused: { shadowOpacity: 0.18, elevation: 8 },
+  searchInput: { flex: 1, fontSize: 15, color: '#1a1a1a', paddingVertical: 4 },
+  clearBtn: { width: 22, height: 22, borderRadius: 11, backgroundColor: '#eee', justifyContent: 'center', alignItems: 'center' },
+
+  // ── Suggestions panel ────────────────────────────────────────
+  suggestionsPanel: { backgroundColor: '#fff', marginHorizontal: 12, borderRadius: 18, marginTop: 8, shadowColor: '#000', shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.1, shadowRadius: 16, elevation: 8, maxHeight: 340, overflow: 'hidden' },
+  currentLocRow: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingHorizontal: 14, paddingVertical: 14 },
+  currentLocIcon: { width: 38, height: 38, borderRadius: 11, justifyContent: 'center', alignItems: 'center' },
+  divider: { height: 1, backgroundColor: '#F0F0F0', marginHorizontal: 14 },
+  sectionLabel: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 14, paddingTop: 10, paddingBottom: 4 },
+  sectionLabelText: { fontSize: 10, fontWeight: '700', color: '#ccc', letterSpacing: 1 },
+  suggList: { flexGrow: 0 },
+  itemSep: { height: 1, backgroundColor: '#F7F7F7', marginLeft: 62 },
+
+  // ── Suggestion card ──────────────────────────────────────────
+  suggCard: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingHorizontal: 14, paddingVertical: 12 },
+  suggIconBox: { width: 38, height: 38, borderRadius: 11, justifyContent: 'center', alignItems: 'center' },
+  suggIconBoxDefault: { backgroundColor: '#F5F5F5' },
+  suggBody: { flex: 1 },
+  suggMain: { fontSize: 14, fontWeight: '600', color: '#1a1a1a', marginBottom: 2 },
+  suggSub: { fontSize: 12, color: '#999' },
+  suggRight: { flexDirection: 'row', alignItems: 'center', gap: 4 },
+  mhBadge: { borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
+  mhBadgeText: { fontSize: 10, fontWeight: '800' },
+
+  // ── Searching / empty states ─────────────────────────────────
+  searchingRow: { flexDirection: 'row', alignItems: 'center', gap: 10, padding: 16 },
+  searchingText: { fontSize: 14, color: '#999' },
+  emptyRow: { alignItems: 'center', paddingVertical: 24, paddingHorizontal: 20, gap: 6 },
+  emptyTitle: { fontSize: 15, fontWeight: '700', color: '#bbb' },
+  emptySub: { fontSize: 13, color: '#ccc', textAlign: 'center' },
+
+  // ── Map ──────────────────────────────────────────────────────
+  mapWrap: { flex: 1, position: 'relative' },
+  map: { width: '100%', height: '100%' },
+  mapPlaceholder: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#f0f0f0', gap: 12 },
+  mapPlaceholderText: { fontSize: 15, color: '#999' },
+
+  mapHint: { position: 'absolute', bottom: 12, alignSelf: 'center', flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: 'rgba(0,0,0,0.5)', paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20 },
+  mapHintText: { fontSize: 12, color: '#fff', fontWeight: '500' },
+
+  loadingOverlay: { ...StyleSheet.absoluteFillObject, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(255,255,255,0.6)' },
+  loadingCard: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#fff', paddingHorizontal: 20, paddingVertical: 12, borderRadius: 30, shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.12, shadowRadius: 8, elevation: 5 },
+  loadingText: { fontSize: 14, fontWeight: '600' },
+
+  myLocFab: { position: 'absolute', right: 14, bottom: 14, width: 46, height: 46, borderRadius: 23, justifyContent: 'center', alignItems: 'center', shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.25, shadowRadius: 6, elevation: 6 },
+
+  // ── Bottom sheet ─────────────────────────────────────────────
+  bottom: { backgroundColor: '#fff', paddingHorizontal: 16, paddingTop: 14, borderTopLeftRadius: 24, borderTopRightRadius: 24, shadowColor: '#000', shadowOffset: { width: 0, height: -4 }, shadowOpacity: 0.08, shadowRadius: 12, elevation: 10 },
+  selectedCard: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: '#FAFAFA', borderRadius: 14, padding: 12, marginBottom: 12, borderLeftWidth: 4 },
+  selectedIconBox: { width: 40, height: 40, borderRadius: 12, justifyContent: 'center', alignItems: 'center' },
+  selectedBody: { flex: 1 },
+  selectedLabel: { fontSize: 10, fontWeight: '800', letterSpacing: 1, marginBottom: 3 },
+  selectedAddr: { fontSize: 14, fontWeight: '600', color: '#1a1a1a', lineHeight: 19 },
+  editBtn: { width: 34, height: 34, borderRadius: 10, backgroundColor: '#F0F0F0', justifyContent: 'center', alignItems: 'center' },
+
+  noSelectionHint: { flexDirection: 'row', alignItems: 'center', gap: 7, justifyContent: 'center', marginBottom: 12 },
+  noSelectionText: { fontSize: 13, color: '#bbb', textAlign: 'center' },
+
+  confirmBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', borderRadius: 16, paddingVertical: 16, gap: 9 },
+  confirmText: { fontSize: 16, fontWeight: '800', color: '#fff' },
 });

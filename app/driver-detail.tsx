@@ -248,13 +248,7 @@ export default function DriverDetail() {
           <Text style={styles.sectionTitle}>Driver Information</Text>
           
           <View style={styles.infoGrid}>
-            {driver.phone && (
-              <View style={styles.infoCard}>
-                <Icon name="phone" size={24} color="#4CAF50" />
-                <Text style={styles.infoLabel}>Phone</Text>
-                <Text style={styles.infoValue}>{driver.phone}</Text>
-              </View>
-            )}
+            {/* Phone is only visible for permanent drivers — regular drivers don't expose contact */}
             
             {driver.agriculturalExperience?.years !== undefined && (
               <View style={styles.infoCard}>

@@ -9,10 +9,13 @@ import {
   Dimensions,
 } from 'react-native';
 import { useRouter } from 'expo-router';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import * as Haptics from 'expo-haptics';
 import { useLanguage } from '../contexts/LanguageContext';
+import { API_URL } from '../lib/env';
+
+const API_BASE = API_URL || 'http://192.168.12.83:5000';
 
 const { width } = Dimensions.get('window');
 
@@ -20,6 +23,27 @@ export default function ProfileAbout() {
   const router = useRouter();
   const { t } = useLanguage();
   const [selectedTab, setSelectedTab] = useState('mission');
+  const [contactInfo, setContactInfo] = useState({
+    email: 'support@krushiexpress.com',
+    phone: '+91 9876543210',
+    address: 'Latur, Maharashtra, India',
+  });
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/admin/app-settings`)
+      .then(r => r.json())
+      .then(res => {
+        if (res.ok && res.data?.appSettings) {
+          const a = res.data.appSettings;
+          setContactInfo({
+            email: a.supportEmail || 'support@krushiexpress.com',
+            phone: a.supportPhone ? `+91 ${a.supportPhone}` : '+91 9876543210',
+            address: a.contactAddress || 'Latur, Maharashtra, India',
+          });
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   const tabs = [
     { id: 'mission', label: t.about.mission, icon: 'flag' },
@@ -235,15 +259,15 @@ export default function ProfileAbout() {
           <View style={styles.contactCard}>
             <View style={styles.contactItem}>
               <Icon name="email" size={24} color="#4CAF50" />
-              <Text style={styles.contactText}>support@krushiexpress.com</Text>
+              <Text style={styles.contactText}>{contactInfo.email}</Text>
             </View>
             <View style={styles.contactItem}>
               <Icon name="phone" size={24} color="#4CAF50" />
-              <Text style={styles.contactText}>+91 9876543210</Text>
+              <Text style={styles.contactText}>{contactInfo.phone}</Text>
             </View>
             <View style={styles.contactItem}>
               <Icon name="location-on" size={24} color="#4CAF50" />
-              <Text style={styles.contactText}>Latur, Maharashtra, India</Text>
+              <Text style={styles.contactText}>{contactInfo.address}</Text>
             </View>
           </View>
         </View>

@@ -8,9 +8,7 @@ import {
   ScrollView,
   ActivityIndicator,
   RefreshControl,
-  Platform,
   Alert,
-  Dimensions,
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import { useState, useEffect, useRef } from 'react';
@@ -20,64 +18,78 @@ import { tripsAPI } from '../services/tripsAPI';
 import { offersAPI } from '../services/offersAPI';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-
-const { width: SCREEN_WIDTH } = Dimensions.get('window');
 import { io, Socket } from 'socket.io-client';
 import { SOCKET_URL } from '../lib/env';
+import { useLanguage } from '../contexts/LanguageContext';
 
 interface Trip {
   _id: string;
-  pickupLocation: {
-    address?: string;
-  };
-  dropLocation: {
-    address?: string;
-  };
-  parcelDetails: {
-    category: string;
-    weight: string;
-  };
+  pickupLocation: { address?: string };
+  dropLocation: { address?: string };
+  parcelDetails: { category: string; weight: string };
   currentTripState: string;
   estimatedFare: number;
   tripDate: string;
-  driver?: {
-    name: string;
-    vehicleDetails: {
-      type: string;
-      number: string;
-    };
-  };
+  driver?: { name: string; vehicleDetails: { type: string; number: string } };
 }
+
+type FilterKey = 'all' | 'active' | 'completed' | 'cancelled';
+
+const STATUS_CONFIG: Record<string, { label: string; color: string; bg: string; icon: string }> = {
+  REQUESTED:             { label: 'Searching',      color: '#F57C00', bg: '#FFF3E0', icon: 'search' },
+  NEGOTIATING:           { label: 'Negotiating',    color: '#F57C00', bg: '#FFF3E0', icon: 'swap-horiz' },
+  ACCEPTED:              { label: 'Accepted',       color: '#2E7D32', bg: '#E8F5E9', icon: 'check-circle' },
+  ENROUTE_TO_PICKUP:     { label: 'Driver Coming',  color: '#1565C0', bg: '#E3F2FD', icon: 'directions-car' },
+  ARRIVED_AT_PICKUP:     { label: 'Driver Arrived', color: '#2E7D32', bg: '#E8F5E9', icon: 'place' },
+  PICKED_UP:             { label: 'Picked Up',      color: '#2E7D32', bg: '#E8F5E9', icon: 'inventory' },
+  ENROUTE_TO_DELIVERY:   { label: 'On the Way',     color: '#1565C0', bg: '#E3F2FD', icon: 'local-shipping' },
+  ARRIVED_AT_DELIVERY:   { label: 'Arrived',        color: '#2E7D32', bg: '#E8F5E9', icon: 'location-on' },
+  DELIVERING:            { label: 'Delivering',     color: '#1565C0', bg: '#E3F2FD', icon: 'delivery-dining' },
+  COMPLETED:             { label: 'Completed',      color: '#2E7D32', bg: '#E8F5E9', icon: 'task-alt' },
+  CANCELLED:             { label: 'Cancelled',      color: '#C62828', bg: '#FFEBEE', icon: 'cancel' },
+  DRIVER_CANCELLED:      { label: 'Driver Cancelled',color: '#C62828',bg: '#FFEBEE', icon: 'cancel' },
+  CUSTOMER_CANCELLED:    { label: 'Cancelled',      color: '#C62828', bg: '#FFEBEE', icon: 'cancel' },
+};
+
+const getStatus = (state: string) => STATUS_CONFIG[state] || { label: state, color: '#666', bg: '#f5f5f5', icon: 'help' };
+
+
+const formatDate = (dateString: string) => {
+  const date = new Date(dateString);
+  return date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+};
+
+const formatTime = (dateString: string) => {
+  const date = new Date(dateString);
+  return date.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+};
 
 export default function MyTrips() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const { t } = useLanguage();
+
+  const FILTERS = [
+    { key: 'all' as FilterKey,       label: t.trips.all,       icon: 'apps' },
+    { key: 'active' as FilterKey,    label: t.trips.active,    icon: 'radio-button-on' },
+    { key: 'completed' as FilterKey, label: t.trips.done,      icon: 'task-alt' },
+    { key: 'cancelled' as FilterKey, label: t.trips.cancelled, icon: 'cancel' },
+  ];
   const [trips, setTrips] = useState<Trip[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
-  const [filter, setFilter] = useState<'all' | 'active' | 'completed' | 'cancelled'>('all');
+  const [filter, setFilter] = useState<FilterKey>('all');
   const [tripsWithDriverOffers, setTripsWithDriverOffers] = useState<Set<string>>(new Set());
   const [socket, setSocket] = useState<Socket | null>(null);
 
   useEffect(() => {
     loadTrips();
     initializeSocket();
-    
-    return () => {
-      if (socket) {
-        socket.disconnect();
-      }
-    };
+    return () => { if (socket) socket.disconnect(); };
   }, [filter]);
 
-  // Periodically check for new driver offers (every 30 seconds to avoid rate limiting)
   useEffect(() => {
-    const interval = setInterval(() => {
-      if (trips.length > 0) {
-        checkDriverOffers(trips);
-      }
-    }, 30000); // Check every 30 seconds to avoid rate limiting
-
+    const interval = setInterval(() => { if (trips.length > 0) checkDriverOffers(trips); }, 30000);
     return () => clearInterval(interval);
   }, [trips]);
 
@@ -85,444 +97,267 @@ export default function MyTrips() {
     try {
       const token = await AsyncStorage.getItem('userToken');
       if (!token) return;
-
-      const newSocket = io(SOCKET_URL, {
-        auth: { token },
-        transports: ['websocket', 'polling'],
-      });
-
-      newSocket.on('connect', () => {
-        console.log('✅ Connected to Socket.IO for trips');
-      });
-
-      // Listen for new driver offers
+      const newSocket = io(SOCKET_URL, { auth: { token }, transports: ['websocket', 'polling'] });
       newSocket.on('new-offer', (data: any) => {
-        console.log('📬 New offer received in my-trips:', data);
         if (data.userType === 'driver' && (data.status === 'PENDING' || !data.status)) {
-          const tripIdStr = data.tripId?.toString() || data.tripId;
-          if (tripIdStr) {
-            console.log('✅ Adding trip to driver offers list:', tripIdStr);
-            setTripsWithDriverOffers((prev) => new Set([...prev, tripIdStr]));
-            // Refresh trips to update UI
-            setTimeout(() => loadTrips(), 300);
-          }
+          const id = data.tripId?.toString();
+          if (id) { setTripsWithDriverOffers(prev => new Set([...prev, id])); setTimeout(() => loadTrips(), 300); }
         }
       });
-
-      // Listen for driver offer received event
       newSocket.on('driver-offer-received', (data: any) => {
-        console.log('📬 Driver offer received event in my-trips:', data);
-        const tripIdStr = data.tripId?.toString() || data.tripId;
-        if (tripIdStr) {
-          console.log('✅ Adding trip to driver offers list from driver-offer-received:', tripIdStr);
-          setTripsWithDriverOffers((prev) => new Set([...prev, tripIdStr]));
-          // Refresh trips to update UI
-          setTimeout(() => loadTrips(), 300);
-        }
+        const id = data.tripId?.toString();
+        if (id) { setTripsWithDriverOffers(prev => new Set([...prev, id])); setTimeout(() => loadTrips(), 300); }
       });
-
-      // Listen for offer updates
       newSocket.on('offer-updated', (data: any) => {
-        console.log('📬 Offer updated:', data);
         if (data.userType === 'driver' && data.status === 'PENDING') {
-          setTripsWithDriverOffers((prev) => new Set([...prev, data.tripId]));
+          setTripsWithDriverOffers(prev => new Set([...prev, data.tripId]));
         } else if (data.status === 'REJECTED' || data.status === 'EXPIRED') {
-          // Remove from set if offer is rejected/expired
-          setTripsWithDriverOffers((prev) => {
-            const newSet = new Set(prev);
-            newSet.delete(data.tripId);
-            return newSet;
-          });
+          setTripsWithDriverOffers(prev => { const s = new Set(prev); s.delete(data.tripId); return s; });
         }
       });
-
-      // Listen for new notifications (which might include offer notifications)
       newSocket.on('new-notification', (data: any) => {
-        console.log('📬 New notification received:', data);
         if (data.type === 'offer' && data.data?.tripId) {
-          setTripsWithDriverOffers((prev) => new Set([...prev, data.data.tripId]));
+          setTripsWithDriverOffers(prev => new Set([...prev, data.data.tripId]));
           loadTrips();
         }
       });
-
       setSocket(newSocket);
-    } catch (error) {
-      console.error('Error initializing socket:', error);
-    }
+    } catch {}
   };
 
   const loadTripsRef = useRef(false);
-  
   const loadTrips = async () => {
-    // Prevent concurrent loads
-    if (loadTripsRef.current) {
-      return;
-    }
-    
+    if (loadTripsRef.current) return;
     try {
       loadTripsRef.current = true;
       const userId = await AsyncStorage.getItem('userId');
-      if (!userId) {
-        router.replace('/login');
-        return;
-      }
-
-      // Map filter to status values
-      const statusMap: { [key: string]: string | undefined } = {
-        'all': undefined,
-        'completed': 'COMPLETED',
-        'cancelled': 'CANCELLED,CUSTOMER_CANCELLED,DRIVER_CANCELLED',
-        'active': 'REQUESTED,NEGOTIATING,ACCEPTED,ENROUTE_TO_PICKUP,ARRIVED_AT_PICKUP,PICKED_UP,ENROUTE_TO_DELIVERY,ARRIVED_AT_DELIVERY,DELIVERING',
+      if (!userId) { router.replace('/login'); return; }
+      const statusMap: Record<string, string | undefined> = {
+        all: undefined,
+        completed: 'COMPLETED',
+        cancelled: 'CANCELLED,CUSTOMER_CANCELLED,DRIVER_CANCELLED',
+        active: 'REQUESTED,NEGOTIATING,ACCEPTED,ENROUTE_TO_PICKUP,ARRIVED_AT_PICKUP,PICKED_UP,ENROUTE_TO_DELIVERY,ARRIVED_AT_DELIVERY,DELIVERING',
       };
-      const status = statusMap[filter];
-      
-      const response = await tripsAPI.getMyTrips(status);
+      const response = await tripsAPI.getMyTrips(statusMap[filter]);
       if (response.ok && response.data) {
-        // Filter trips for current user
-        const userTrips = Array.isArray(response.data) 
-          ? response.data.filter((trip: any) => trip.customerId === userId)
-          : [];
+        const userTrips = Array.isArray(response.data) ? response.data.filter((t: any) => t.customerId === userId) : [];
         setTrips(userTrips);
-        
-        // Check for driver offers for each trip (with delay to avoid rate limiting)
-        setTimeout(() => {
-          checkDriverOffers(userTrips);
-        }, 500);
+        setTimeout(() => checkDriverOffers(userTrips), 500);
       }
     } catch (error: any) {
-      // Handle rate limit errors gracefully
       if (error.message?.includes('slow down') || error.status === 429) {
-        console.log('⚠️ Rate limited, will retry later');
-        // Retry after delay
-        setTimeout(() => {
-          loadTripsRef.current = false;
-          loadTrips();
-        }, 5000);
+        setTimeout(() => { loadTripsRef.current = false; loadTrips(); }, 5000);
         return;
       }
-      console.error('Error loading trips:', error);
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-      loadTripsRef.current = false;
-    }
-  };
-
-  const onRefresh = () => {
-    setRefreshing(true);
-    loadTrips();
+    } finally { setLoading(false); setRefreshing(false); loadTripsRef.current = false; }
   };
 
   const checkDriverOffersRef = useRef(false);
-  
   const checkDriverOffers = async (tripsList: Trip[]) => {
-    // Prevent concurrent checks
-    if (checkDriverOffersRef.current) {
-      return;
-    }
-    
+    if (checkDriverOffersRef.current) return;
     try {
       checkDriverOffersRef.current = true;
-      const tripsWithOffers = new Set<string>();
-      
-      // Check offers for trips in REQUESTED or NEGOTIATING state
-      const tripsToCheck = tripsList.filter(
-        (trip) => trip.currentTripState === 'REQUESTED' || trip.currentTripState === 'NEGOTIATING'
-      );
-      
-      // Limit to max 5 trips at a time to avoid rate limiting
-      const tripsToCheckLimited = tripsToCheck.slice(0, 5);
-      
-      // Check offers for each trip sequentially (not parallel) to avoid rate limiting
-      for (const trip of tripsToCheckLimited) {
+      const withOffers = new Set<string>();
+      const toCheck = tripsList.filter(t => t.currentTripState === 'REQUESTED' || t.currentTripState === 'NEGOTIATING').slice(0, 5);
+      for (const trip of toCheck) {
         try {
-          // Small delay between requests
-          await new Promise(resolve => setTimeout(resolve, 200));
-          
-          const offersResponse = await offersAPI.getTripOffers(trip._id);
-          if (offersResponse.ok && offersResponse.data) {
-            // Check if there are any pending offers from drivers
-            const hasDriverOffer = offersResponse.data.some(
-              (offer: any) => offer.userType === 'driver' && offer.status === 'PENDING'
-            );
-            if (hasDriverOffer) {
-              tripsWithOffers.add(trip._id);
-            }
+          await new Promise(r => setTimeout(r, 200));
+          const res = await offersAPI.getTripOffers(trip._id);
+          if (res.ok && res.data?.some((o: any) => o.userType === 'driver' && o.status === 'PENDING')) {
+            withOffers.add(trip._id);
           }
-        } catch (error: any) {
-          // Skip rate limit errors silently
-          if (error.message?.includes('slow down') || error.status === 429) {
-            console.log('⚠️ Rate limited, skipping offer check');
-            break; // Stop checking if rate limited
-          }
-          console.error(`Error checking offers for trip ${trip._id}:`, error);
+        } catch (e: any) {
+          if (e.message?.includes('slow down') || e.status === 429) break;
         }
       }
-      
-      setTripsWithDriverOffers(tripsWithOffers);
-    } catch (error) {
-      console.error('Error checking driver offers:', error);
-    } finally {
-      checkDriverOffersRef.current = false;
-    }
-  };
-
-  const getTripStatusColor = (state: string) => {
-    const statusMap: { [key: string]: string } = {
-      REQUESTED: '#FF9800',
-      NEGOTIATING: '#FF9800',
-      ACCEPTED: '#4CAF50',
-      ENROUTE_TO_PICKUP: '#2196F3',
-      ARRIVED_AT_PICKUP: '#4CAF50',
-      PICKED_UP: '#4CAF50',
-      ENROUTE_TO_DELIVERY: '#2196F3',
-      ARRIVED_AT_DELIVERY: '#4CAF50',
-      DELIVERING: '#4CAF50',
-      COMPLETED: '#4CAF50',
-      CANCELLED: '#f44336',
-      DRIVER_CANCELLED: '#f44336',
-      CUSTOMER_CANCELLED: '#f44336',
-    };
-    return statusMap[state] || '#666';
-  };
-
-  const getTripStatusText = (state: string) => {
-    const statusMap: { [key: string]: string } = {
-      REQUESTED: 'Request Sent',
-      NEGOTIATING: 'Negotiating',
-      ACCEPTED: 'Driver Accepted',
-      ENROUTE_TO_PICKUP: 'Driver Coming',
-      ARRIVED_AT_PICKUP: 'Driver Arrived',
-      PICKED_UP: 'Picked Up',
-      ENROUTE_TO_DELIVERY: 'On the Way',
-      ARRIVED_AT_DELIVERY: 'Arrived',
-      DELIVERING: 'Delivering',
-      COMPLETED: 'Completed',
-      CANCELLED: 'Canceled',
-      DRIVER_CANCELLED: 'Driver Canceled',
-      CUSTOMER_CANCELLED: 'Canceled',
-    };
-    return statusMap[state] || state;
-  };
-
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString);
-    return date.toLocaleDateString('en-IN', {
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
+      setTripsWithDriverOffers(withOffers);
+    } finally { checkDriverOffersRef.current = false; }
   };
 
   const handleTripPress = async (trip: Trip) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    
-    // If trip is completed, check if needs rating
     if (trip.currentTripState === 'COMPLETED') {
       try {
         const skipped = await AsyncStorage.getItem(`rating_skipped_${trip._id}`);
         if (!skipped) {
           const ratingResponse = await tripsAPI.getTripRating(trip._id);
           if (ratingResponse.ok && !ratingResponse.data) {
-            // Not rated and not skipped, show rating prompt
-            Alert.alert(
-              'Rate Your Trip',
-              'How was your experience? Please rate your driver.',
-              [
-                {
-                  text: 'Later',
-                  style: 'cancel',
-                  onPress: () => router.push(`/trip-tracking?id=${trip._id}`),
-                },
-                {
-                  text: 'Rate Now',
-                  onPress: () => router.push(`/rate-trip?tripId=${trip._id}`),
-                },
-              ]
-            );
+            Alert.alert('Rate Your Trip', 'How was your experience?', [
+              { text: 'Later', style: 'cancel', onPress: () => router.push(`/trip-tracking?id=${trip._id}`) },
+              { text: 'Rate Now', onPress: () => router.push(`/rate-trip?tripId=${trip._id}`) },
+            ]);
             return;
           }
         }
-      } catch (error) {
-        console.error('Error checking rating:', error);
-      }
+      } catch {}
     }
-    
     router.push(`/trip-tracking?id=${trip._id}`);
   };
 
+  const activeCount = trips.filter(tr => ['REQUESTED','NEGOTIATING','ACCEPTED','ENROUTE_TO_PICKUP','ARRIVED_AT_PICKUP','PICKED_UP','ENROUTE_TO_DELIVERY','ARRIVED_AT_DELIVERY','DELIVERING'].includes(tr.currentTripState)).length;
+
   if (loading) {
     return (
-      <SafeAreaView style={styles.safeArea}>
-        <View style={styles.loadingContainer}>
+      <SafeAreaView style={styles.safe}>
+        <View style={styles.loadingWrap}>
           <ActivityIndicator size="large" color="#4CAF50" />
-          <Text style={styles.loadingText}>Loading trips...</Text>
+          <Text style={styles.loadingText}>{t.common.loading}</Text>
         </View>
       </SafeAreaView>
     );
   }
 
   return (
-    <SafeAreaView style={[styles.safeArea, { paddingTop: insets.top }]} edges={['top']}>
-      <StatusBar barStyle="dark-content" backgroundColor="#fff" />
-      
-      {/* Header */}
+    <SafeAreaView style={[styles.safe, { paddingTop: insets.top }]}>
+      <StatusBar barStyle="light-content" backgroundColor="#1B5E20" />
+
+      {/* ── Header ── */}
       <View style={styles.header}>
-        <TouchableOpacity
-          onPress={() => {
-            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-            router.back();
-          }}
-          style={styles.backButton}
-        >
-          <Icon name="arrow-back" size={24} color="#1a1a1a" />
-        </TouchableOpacity>
-        <Text style={styles.headerTitle}>My Trips</Text>
-        <View style={styles.backButton} />
-      </View>
-
-      {/* Filter Tabs */}
-      <View style={styles.filterContainer}>
-        {[
-          { key: 'all', label: 'All' },
-          { key: 'completed', label: 'Done' },
-          { key: 'cancelled', label: 'Canceled' },
-          { key: 'active', label: 'Active' },
-        ].map(({ key, label }) => (
-          <TouchableOpacity
-            key={key}
-            style={[styles.filterTab, filter === key && styles.filterTabActive]}
-            onPress={() => {
-              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-              setFilter(key as 'all' | 'active' | 'completed' | 'cancelled');
-            }}
-          >
-            <Text
-              style={[
-                styles.filterTabText,
-                filter === key && styles.filterTabTextActive,
-              ]}
-            >
-              {label}
-            </Text>
+        <View style={styles.headerDec1} />
+        <View style={styles.headerDec2} />
+        <View style={styles.headerRow}>
+          {router.canGoBack() && (
+            <TouchableOpacity style={styles.backBtn} onPress={() => { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); router.back(); }}>
+              <Icon name="arrow-back" size={22} color="#fff" />
+            </TouchableOpacity>
+          )}
+          <View style={{ flex: 1 }}>
+            <Text style={styles.headerTitle}>{t.trips.title}</Text>
+            <Text style={styles.headerSub}>{trips.length} {t.trips.tripCount}{trips.length !== 1 ? 's' : ''}{activeCount > 0 ? ` · ${activeCount} ${t.trips.active.toLowerCase()}` : ''}</Text>
+          </View>
+          <TouchableOpacity style={styles.refreshBtn} onPress={() => { setRefreshing(true); loadTrips(); }}>
+            <Icon name="refresh" size={20} color="#A5D6A7" />
           </TouchableOpacity>
-        ))}
+        </View>
+
+        {/* ── Filter Pills ── */}
+        <View style={styles.filterRow}>
+          {FILTERS.map(f => (
+            <TouchableOpacity
+              key={f.key}
+              style={[styles.filterPill, filter === f.key && styles.filterPillActive]}
+              onPress={() => { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); setFilter(f.key); }}
+              activeOpacity={0.8}
+            >
+              <Icon name={f.icon as any} size={14} color={filter === f.key ? '#fff' : '#A5D6A7'} />
+              <Text style={[styles.filterPillText, filter === f.key && styles.filterPillTextActive]}>{f.label}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
       </View>
 
-      {/* Trips List */}
+      {/* ── List ── */}
       <ScrollView
-        style={styles.content}
-        contentContainerStyle={{ paddingBottom: insets.bottom + 100 }}
+        contentContainerStyle={{ paddingBottom: insets.bottom + 100, paddingTop: 12 }}
         showsVerticalScrollIndicator={false}
-        refreshControl={
-          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#4CAF50" />
-        }
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); loadTrips(); }} tintColor="#4CAF50" />}
       >
         {trips.length === 0 ? (
-          <View style={styles.emptyState}>
-            <Icon name="history" size={64} color="#ccc" />
-            <Text style={styles.emptyStateText}>No trips found</Text>
-            <Text style={styles.emptyStateSubtext}>
-              {filter === 'all'
-                ? 'Your trip history will appear here'
-                : filter === 'active'
-                ? 'You have no active trips'
-                : filter === 'completed'
-                ? 'You have no completed trips'
-                : 'You have no canceled trips'}
+          <View style={styles.emptyWrap}>
+            <View style={styles.emptyIconBox}>
+              <Icon name="local-shipping" size={48} color="#A5D6A7" />
+            </View>
+            <Text style={styles.emptyTitle}>{t.trips.noTrips}</Text>
+            <Text style={styles.emptySub}>
+              {filter === 'all' ? t.trips.bookTrip :
+               filter === 'active' ? t.trips.noActiveTrips :
+               filter === 'completed' ? t.trips.noCompletedTrips :
+               t.trips.noCancelledTrips}
             </Text>
+            {filter === 'all' && (
+              <TouchableOpacity style={styles.bookBtn} onPress={() => router.push('/(tabs)/home')}>
+                <Text style={styles.bookBtnText}>{t.trips.bookTrip}</Text>
+                <Icon name="arrow-forward" size={18} color="#fff" />
+              </TouchableOpacity>
+            )}
           </View>
         ) : (
-          trips.map((trip) => (
-            <TouchableOpacity
-              key={trip._id}
-              style={styles.tripCard}
-              onPress={() => handleTripPress(trip)}
-              activeOpacity={0.7}
-            >
-              <View style={styles.tripHeader}>
-                <View style={styles.tripStatus}>
-                  <View
-                    style={[
-                      styles.statusDot,
-                      { backgroundColor: getTripStatusColor(trip.currentTripState) },
-                    ]}
-                  />
-                  <Text style={styles.tripStatusText}>
-                    {getTripStatusText(trip.currentTripState)}
-                  </Text>
-                </View>
-                <Text style={styles.tripDate}>{formatDate(trip.tripDate)}</Text>
-              </View>
+          trips.map(trip => {
+            const status = getStatus(trip.currentTripState);
+            const hasOffer = tripsWithDriverOffers.has(trip._id);
+            const isActive = !['COMPLETED','CANCELLED','DRIVER_CANCELLED','CUSTOMER_CANCELLED'].includes(trip.currentTripState);
 
-              <View style={styles.tripLocations}>
-                <View style={styles.locationRow}>
-                  <View style={[styles.locationDot, { backgroundColor: '#4CAF50' }]} />
-                  <Text style={styles.locationText} numberOfLines={1}>
-                    {trip.pickupLocation.address || 'Pickup Location'}
-                  </Text>
-                </View>
-                <View style={styles.locationRow}>
-                  <View style={[styles.locationDot, { backgroundColor: '#FF9800' }]} />
-                  <Text style={styles.locationText} numberOfLines={1}>
-                    {trip.dropLocation.address || 'Drop Location'}
-                  </Text>
-                </View>
-              </View>
+            return (
+              <TouchableOpacity key={trip._id} style={[styles.card, isActive && styles.cardActive]} onPress={() => handleTripPress(trip)} activeOpacity={0.75}>
 
-              <View style={styles.tripDetails}>
-                <View style={styles.detailItem}>
-                  <Icon name="category" size={16} color="#666" />
-                  <Text style={styles.detailText}>
-                    {trip.parcelDetails.category} • {trip.parcelDetails.weight}
-                  </Text>
-                </View>
-                {trip.driver ? (
-                  <View style={styles.driverNameContainer}>
-                    <Icon name="person" size={18} color="#4CAF50" />
-                    <Text style={styles.driverNameText}>
-                      {trip.driver.name}
-                    </Text>
-                    {trip.driver.vehicleDetails?.type && (
-                      <Text style={styles.driverVehicleText}>
-                        • {trip.driver.vehicleDetails.type}
-                      </Text>
-                    )}
+                {/* Status bar top accent */}
+                <View style={[styles.cardAccent, { backgroundColor: status.color }]} />
+
+                {/* Header row */}
+                <View style={styles.cardHeader}>
+                  <View style={[styles.statusBadge, { backgroundColor: status.bg }]}>
+                    <Icon name={status.icon as any} size={13} color={status.color} />
+                    <Text style={[styles.statusText, { color: status.color }]}>{status.label}</Text>
                   </View>
-                ) : (
-                  <View style={styles.detailItem}>
-                    <Icon name="person-outline" size={16} color="#999" />
-                    <Text style={[styles.detailText, { color: '#999', fontStyle: 'italic' }]}>
-                      Driver not assigned yet
-                    </Text>
+                  <View style={styles.dateBox}>
+                    <Text style={styles.dateText}>{formatDate(trip.tripDate)}</Text>
+                    <Text style={styles.timeText}>{formatTime(trip.tripDate)}</Text>
                   </View>
-                )}
-              </View>
+                </View>
 
-              <View style={styles.tripFooter}>
-                <View style={styles.footerLeft}>
-                  <Text style={styles.tripFare}>₹{trip.estimatedFare.toFixed(0)}</Text>
-                  {/* Only show negotiate button if driver has sent an offer */}
-                  {tripsWithDriverOffers.has(trip._id) && (
-                    <TouchableOpacity
-                      style={styles.negotiateButton}
-                      onPress={() => {
-                        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                        router.push(`/trip-negotiation?tripId=${trip._id}`);
-                      }}
-                      activeOpacity={0.7}
-                    >
-                      <Icon name="chat" size={16} color="#FF9800" />
-                      <Text style={styles.negotiateButtonText}>Negotiate</Text>
-                    </TouchableOpacity>
+                {/* Route visualization */}
+                <View style={styles.routeBox}>
+                  <View style={styles.routeIcons}>
+                    <View style={styles.routeDotGreen} />
+                    <View style={styles.routeLine} />
+                    <View style={styles.routeDotOrange} />
+                  </View>
+                  <View style={styles.routeLabels}>
+                    <View style={styles.routeLocationBox}>
+                      <Text style={styles.routeLocationLabel}>{t.trips.from}</Text>
+                      <Text style={styles.routeLocation} numberOfLines={1}>{trip.pickupLocation.address || t.home.pickupLocation}</Text>
+                    </View>
+                    <View style={styles.routeLocationBox}>
+                      <Text style={styles.routeLocationLabel}>{t.trips.to}</Text>
+                      <Text style={styles.routeLocation} numberOfLines={1}>{trip.dropLocation.address || t.home.dropLocation}</Text>
+                    </View>
+                  </View>
+                </View>
+
+                {/* Details row */}
+                <View style={styles.detailsRow}>
+                  <View style={styles.detailChip}>
+                    <Icon name="inventory-2" size={13} color="#666" />
+                    <Text style={styles.detailChipText}>{trip.parcelDetails.category}</Text>
+                  </View>
+                  <View style={styles.detailChip}>
+                    <Icon name="scale" size={13} color="#666" />
+                    <Text style={styles.detailChipText}>{trip.parcelDetails.weight}</Text>
+                  </View>
+                  {trip.driver && (
+                    <View style={[styles.detailChip, { backgroundColor: '#E8F5E9', borderColor: '#C8E6C9' }]}>
+                      <Icon name="person" size={13} color="#2E7D32" />
+                      <Text style={[styles.detailChipText, { color: '#2E7D32' }]}>{trip.driver.name}</Text>
+                    </View>
                   )}
                 </View>
-                <Icon name="chevron-right" size={24} color="#ccc" />
-              </View>
-            </TouchableOpacity>
-          ))
+
+                {/* Footer */}
+                <View style={styles.cardFooter}>
+                  <View>
+                    <Text style={styles.fareLabel}>{t.trips.estimatedFare}</Text>
+                    <Text style={styles.fareAmount}>₹{trip.estimatedFare.toFixed(0)}</Text>
+                  </View>
+                  <View style={styles.cardFooterRight}>
+                    {hasOffer && (
+                      <TouchableOpacity
+                        style={styles.negotiateBtn}
+                        onPress={() => { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); router.push(`/trip-negotiation?tripId=${trip._id}`); }}
+                        activeOpacity={0.8}
+                      >
+                        <Icon name="gavel" size={15} color="#fff" />
+                        <Text style={styles.negotiateBtnText}>{t.trips.negotiate}</Text>
+                      </TouchableOpacity>
+                    )}
+                    <View style={styles.viewBtn}>
+                      <Text style={styles.viewBtnText}>{t.trips.view}</Text>
+                      <Icon name="chevron-right" size={18} color="#4CAF50" />
+                    </View>
+                  </View>
+                </View>
+              </TouchableOpacity>
+            );
+          })
         )}
       </ScrollView>
     </SafeAreaView>
@@ -530,216 +365,67 @@ export default function MyTrips() {
 }
 
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: '#fff',
-  },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  loadingText: {
-    fontSize: 16,
-    color: '#666',
-    marginTop: 16,
-  },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    padding: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f0f0f0',
-  },
-  backButton: {
-    width: 40,
-    height: 40,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  headerTitle: {
-    fontSize: 20,
-    fontWeight: '700',
-    color: '#1a1a1a',
-  },
-  filterContainer: {
-    flexDirection: 'row',
-    padding: 16,
-    gap: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f0f0f0',
-  },
-  filterTab: {
-    flex: 1,
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    borderRadius: 12,
-    backgroundColor: '#f5f5f5',
-    alignItems: 'center',
-  },
-  filterTabActive: {
-    backgroundColor: '#4CAF50',
-  },
-  filterTabText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#666',
-  },
-  filterTabTextActive: {
-    color: '#fff',
-  },
-  content: {
-    flex: 1,
-  },
-  emptyState: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 80,
-    paddingHorizontal: 40,
-  },
-  emptyStateText: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: '#666',
-    marginTop: 24,
-  },
-  emptyStateSubtext: {
-    fontSize: 14,
-    color: '#999',
-    marginTop: 8,
-    textAlign: 'center',
-  },
-  tripCard: {
-    backgroundColor: '#fff',
-    marginHorizontal: 16,
-    marginTop: 16,
-    borderRadius: 16,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: '#f0f0f0',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.05,
-    shadowRadius: 4,
-    elevation: 2,
-  },
-  tripHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 12,
-  },
-  tripStatus: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  statusDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-  },
-  tripStatusText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#1a1a1a',
-  },
-  tripDate: {
-    fontSize: 12,
-    color: '#999',
-  },
-  tripLocations: {
-    marginBottom: 12,
-  },
-  locationRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 8,
-    gap: 12,
-  },
-  locationDot: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-  },
-  locationText: {
-    flex: 1,
-    fontSize: 14,
-    fontWeight: '500',
-    color: '#1a1a1a',
-  },
-  tripDetails: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 16,
-    marginBottom: 12,
-  },
-  detailItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  detailText: {
-    fontSize: 12,
-    color: '#666',
-  },
-  driverNameContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    marginBottom: 8,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    backgroundColor: '#F7FDF8',
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#E8F5E9',
-  },
-  driverNameText: {
-    fontSize: Math.max(14, SCREEN_WIDTH * 0.038),
-    fontWeight: '700',
-    color: '#1a1a1a',
-    flex: 1,
-  },
-  driverVehicleText: {
-    fontSize: Math.max(12, SCREEN_WIDTH * 0.033),
-    color: '#666',
-    fontWeight: '500',
-  },
-  tripFooter: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingTop: 12,
-    borderTopWidth: 1,
-    borderTopColor: '#f0f0f0',
-  },
-  footerLeft: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-  },
-  tripFare: {
-    fontSize: 20,
-    fontWeight: '700',
-    color: '#4CAF50',
-  },
-  negotiateButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    backgroundColor: '#FFF3E0',
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: '#FFE0B2',
-  },
-  negotiateButtonText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#FF9800',
-  },
-});
+  safe: { flex: 1, backgroundColor: '#F4F6F9' },
+  loadingWrap: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 12 },
+  loadingText: { fontSize: 15, color: '#999' },
 
+  // ── Header ──
+  header: { backgroundColor: '#2E7D32', paddingBottom: 12, overflow: 'hidden' },
+  headerDec1: { position: 'absolute', width: 160, height: 160, borderRadius: 80, backgroundColor: 'rgba(255,255,255,0.05)', top: -50, right: -30 },
+  headerDec2: { position: 'absolute', width: 100, height: 100, borderRadius: 50, backgroundColor: 'rgba(255,255,255,0.04)', bottom: -30, left: 40 },
+  headerRow: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, paddingTop: 16, paddingBottom: 12, gap: 12 },
+  backBtn: { width: 38, height: 38, borderRadius: 19, backgroundColor: 'rgba(255,255,255,0.15)', justifyContent: 'center', alignItems: 'center' },
+  headerTitle: { fontSize: 22, fontWeight: '800', color: '#fff' },
+  headerSub: { fontSize: 12, color: '#A5D6A7', marginTop: 2 },
+  refreshBtn: { width: 38, height: 38, borderRadius: 19, backgroundColor: 'rgba(255,255,255,0.12)', justifyContent: 'center', alignItems: 'center' },
+  filterRow: { flexDirection: 'row', paddingHorizontal: 12, paddingBottom: 10, gap: 6 },
+  filterPill: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, paddingVertical: 8, borderRadius: 20, backgroundColor: 'rgba(255,255,255,0.1)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.15)' },
+  filterPillActive: { backgroundColor: '#fff' },
+  filterPillText: { fontSize: 13, fontWeight: '600', color: '#A5D6A7' },
+  filterPillTextActive: { color: '#2E7D32' },
+
+  // ── Empty ──
+  emptyWrap: { alignItems: 'center', paddingTop: 80, paddingHorizontal: 40, gap: 12 },
+  emptyIconBox: { width: 96, height: 96, borderRadius: 48, backgroundColor: '#E8F5E9', justifyContent: 'center', alignItems: 'center', marginBottom: 8 },
+  emptyTitle: { fontSize: 20, fontWeight: '700', color: '#1a1a1a' },
+  emptySub: { fontSize: 14, color: '#aaa', textAlign: 'center', lineHeight: 22 },
+  bookBtn: { flexDirection: 'row', alignItems: 'center', gap: 8, backgroundColor: '#4CAF50', borderRadius: 14, paddingVertical: 14, paddingHorizontal: 24, marginTop: 8 },
+  bookBtnText: { fontSize: 15, fontWeight: '700', color: '#fff' },
+
+  // ── Card ──
+  card: { backgroundColor: '#fff', marginHorizontal: 16, marginBottom: 12, borderRadius: 18, overflow: 'hidden', shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.07, shadowRadius: 8, elevation: 3 },
+  cardActive: { shadowColor: '#2E7D32', shadowOpacity: 0.12 },
+  cardAccent: { height: 4 },
+  cardHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingTop: 12, paddingBottom: 10 },
+  statusBadge: { flexDirection: 'row', alignItems: 'center', gap: 5, borderRadius: 10, paddingHorizontal: 10, paddingVertical: 5 },
+  statusText: { fontSize: 12, fontWeight: '700' },
+  dateBox: { alignItems: 'flex-end' },
+  dateText: { fontSize: 12, fontWeight: '600', color: '#444' },
+  timeText: { fontSize: 11, color: '#aaa', marginTop: 1 },
+
+  // ── Route ──
+  routeBox: { flexDirection: 'row', paddingHorizontal: 16, paddingBottom: 12, gap: 12, borderBottomWidth: 1, borderBottomColor: '#f5f5f5' },
+  routeIcons: { alignItems: 'center', paddingTop: 4, gap: 0 },
+  routeDotGreen: { width: 11, height: 11, borderRadius: 6, backgroundColor: '#4CAF50', borderWidth: 2, borderColor: '#C8E6C9' },
+  routeLine: { width: 2, flex: 1, backgroundColor: '#e0e0e0', marginVertical: 3, minHeight: 20 },
+  routeDotOrange: { width: 11, height: 11, borderRadius: 3, backgroundColor: '#FF9800', borderWidth: 2, borderColor: '#FFE0B2' },
+  routeLabels: { flex: 1, gap: 10 },
+  routeLocationBox: {},
+  routeLocationLabel: { fontSize: 9, fontWeight: '700', color: '#bbb', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 2 },
+  routeLocation: { fontSize: 13, fontWeight: '600', color: '#1a1a1a' },
+
+  // ── Details ──
+  detailsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#f5f5f5' },
+  detailChip: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: '#f7f7f7', borderRadius: 8, paddingHorizontal: 8, paddingVertical: 4, borderWidth: 1, borderColor: '#eee' },
+  detailChipText: { fontSize: 12, color: '#555', fontWeight: '500' },
+
+  // ── Footer ──
+  cardFooter: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingVertical: 12 },
+  fareLabel: { fontSize: 11, color: '#aaa', fontWeight: '500', marginBottom: 2 },
+  fareAmount: { fontSize: 22, fontWeight: '800', color: '#2E7D32' },
+  cardFooterRight: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  negotiateBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: '#FF9800', borderRadius: 12, paddingVertical: 8, paddingHorizontal: 14 },
+  negotiateBtnText: { fontSize: 13, fontWeight: '700', color: '#fff' },
+  viewBtn: { flexDirection: 'row', alignItems: 'center', gap: 2 },
+  viewBtnText: { fontSize: 13, fontWeight: '600', color: '#4CAF50' },
+});

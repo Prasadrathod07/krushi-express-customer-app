@@ -14,9 +14,31 @@ export default function Index() {
   const checkAuth = async () => {
     try {
       const token = await AsyncStorage.getItem('userToken');
-      setIsAuthenticated(!!token);
+      if (!token) {
+        setIsAuthenticated(false);
+        return;
+      }
+
+      // Decode JWT locally to check expiry — no network call needed
+      try {
+        const payload = JSON.parse(atob(token.split('.')[1]));
+        if (Date.now() > payload.exp * 1000) {
+          // Token expired — clear all auth data and send to login
+          await AsyncStorage.multiRemove(['userToken', 'userId', 'userName', 'userEmail']);
+          setIsAuthenticated(false);
+          return;
+        }
+      } catch {
+        // Malformed token — clear and send to login
+        await AsyncStorage.multiRemove(['userToken', 'userId', 'userName', 'userEmail']);
+        setIsAuthenticated(false);
+        return;
+      }
+
+      setIsAuthenticated(true);
     } catch (error) {
       console.error('Auth check error:', error);
+      setIsAuthenticated(false);
     } finally {
       setIsLoading(false);
     }

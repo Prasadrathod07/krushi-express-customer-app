@@ -35,8 +35,8 @@
     ],
     "extra": {
       
-      "SOCKET_IO_URL": "http://192.168.12.81:5000",
-      "API_BASE_URL": "http://192.168.12.81:5000",
+      "SOCKET_IO_URL": "http://192.168.12.83:5000",
+      "API_BASE_URL": "http://192.168.12.83:5000",
       "CLOUDINARY_CLOUD_NAME": "dvzg4pod2"
     }
   }

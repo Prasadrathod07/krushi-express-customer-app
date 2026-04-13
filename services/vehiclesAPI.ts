@@ -111,8 +111,9 @@ export const vehiclesAPI = {
   },
 
   // Get all registered drivers (for customer app - excludes sensitive data)
-  getAllDrivers: async (limit: number = 100, skip: number = 0) => {
-    return apiRequest(`/api/drivers?limit=${limit}&skip=${skip}&isActive=true&isVerified=true`, {
+  getAllDrivers: async (limit: number = 100, skip: number = 0, status?: string) => {
+    const statusParam = status ? `&status=${status}` : '';
+    return apiRequest(`/api/drivers?limit=${limit}&skip=${skip}${statusParam}`, {
       method: 'GET',
     });
   },

@@ -159,6 +159,19 @@ export const tripsAPI = {
     });
   },
 
+  // Start Priority Search (Phase 2: 10-20km)
+  startPrioritySearch: async (tripId: string) => {
+    return apiRequest(`/api/trips/${tripId}/priority-search`, { method: 'POST' });
+  },
+
+  // Respond to driver's negotiation offer
+  respondToOffer: async (tripId: string, action: 'accept' | 'reject') => {
+    return apiRequest(`/api/trips/${tripId}/negotiate/respond`, {
+      method: 'POST',
+      body: JSON.stringify({ action }),
+    });
+  },
+
   // Get trip by ID
   getTrip: async (tripId: string) => {
     return apiRequest(`/api/trips/${tripId}`, {
@@ -234,6 +247,24 @@ export const tripsAPI = {
     return apiRequest(`/api/trips/${tripId}/verify-otp`, {
       method: 'POST',
       body: JSON.stringify({ otp }),
+    });
+  },
+
+  // Cancel trip (customer)
+  cancelTrip: async (tripId: string, reason?: string) => {
+    return apiRequest(`/api/trips/${tripId}/state`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        state: 'CUSTOMER_CANCELLED',
+        additionalData: { cancellationReason: reason || 'Cancelled by customer' },
+      }),
+    });
+  },
+
+  // Cancel negotiation with current driver and requeue trip for another driver
+  cancelNegotiation: async (tripId: string) => {
+    return apiRequest(`/api/trips/${tripId}/cancel-negotiation`, {
+      method: 'POST',
     });
   },
 };

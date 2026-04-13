@@ -25,6 +25,7 @@ import { io, Socket } from 'socket.io-client';
 import { SOCKET_URL } from '../lib/env';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useTrip } from '../contexts/TripContext';
+import { getRouteInfo } from '../services/directionsService';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -97,6 +98,8 @@ export default function ActiveTripScreen() {
   const [otpVerified, setOtpVerified] = useState(false);
   const [userType, setUserType] = useState<'customer' | 'driver'>('customer');
   const [routeCoordinates, setRouteCoordinates] = useState<Array<{ latitude: number; longitude: number }>>([]);
+  // Road route from pickup to drop (fetched once when trip loads)
+  const [tripRouteCoordinates, setTripRouteCoordinates] = useState<Array<{ latitude: number; longitude: number }>>([]);
 
   const mapRef = useRef<MapView>(null);
   const lastLocationRef = useRef<{ latitude: number; longitude: number } | null>(null);
@@ -154,6 +157,32 @@ export default function ActiveTripScreen() {
       }
     }
   }, [trip]);
+
+  // Fetch road route from pickup to drop when trip data is available
+  useEffect(() => {
+    if (!trip) return;
+    const pickupCoords = trip.pickupLocation?.coordinates;
+    const dropCoords = trip.dropLocation?.coordinates;
+    if (!pickupCoords || !dropCoords) return;
+
+    const pickup = { latitude: pickupCoords[1], longitude: pickupCoords[0] };
+    const drop = { latitude: dropCoords[1], longitude: dropCoords[0] };
+
+    getRouteInfo(pickup, drop).then((info) => {
+      setTripRouteCoordinates(info.coordinates);
+    });
+  }, [trip?._id]); // Only re-fetch when trip changes, not on every render
+
+  // Fetch road route from driver to pickup when driver location updates
+  useEffect(() => {
+    if (!driverLocation || !trip?.pickupLocation) return;
+    const pickupCoords = trip.pickupLocation.coordinates;
+    const pickup = { latitude: pickupCoords[1], longitude: pickupCoords[0] };
+
+    getRouteInfo(driverLocation, pickup).then((info) => {
+      setRouteCoordinates(info.coordinates);
+    });
+  }, [driverLocation]);
 
   // CRITICAL: Smooth marker animation - only animate if location changed significantly
   useEffect(() => {
@@ -233,16 +262,7 @@ export default function ActiveTripScreen() {
               setDistance(data.distance);
             }
             
-            // Update route coordinates
-            const currentTrip = activeTrip || trip;
-            if (currentTrip?.pickupLocation) {
-              const pickupCoords = currentTrip.pickupLocation.coordinates;
-              const pickupLatLng = { latitude: pickupCoords[1], longitude: pickupCoords[0] };
-              setRouteCoordinates([
-                pickupLatLng,
-                newLocation
-              ]);
-            }
+            // Route from driver to pickup is updated via useEffect on driverLocation
           }
         }
       });
@@ -377,6 +397,15 @@ export default function ActiveTripScreen() {
             <Text style={styles.backButtonText}>Go Home</Text>
           </TouchableOpacity>
         </View>
+      </SafeAreaView>
+    );
+  }
+
+  // Guard: location data missing (race condition during state transition)
+  if (!trip.pickupLocation?.coordinates || !trip.dropLocation?.coordinates) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <ActivityIndicator size="large" color="#16A34A" style={{ flex: 1 }} />
       </SafeAreaView>
     );
   }
@@ -529,22 +558,25 @@ export default function ActiveTripScreen() {
             </Marker>
           )}
 
-          {/* Route Line from Driver to Pickup */}
+          {/* Route Line from Driver to Pickup - road-based */}
           {driverLocation && routeCoordinates.length > 0 && (trip.currentTripState === 'ACCEPTED' || trip.currentTripState === 'ENROUTE_TO_PICKUP') && (
             <Polyline
               coordinates={routeCoordinates}
               strokeColor="#2196F3"
-              strokeWidth={4}
-              lineDashPattern={[5, 5]}
+              strokeWidth={5}
             />
           )}
           
-          {/* Route Line from Pickup to Drop */}
+          {/* Route Line from Pickup to Drop - road-based */}
           {(trip.currentTripState === 'PICKED_UP' || trip.currentTripState === 'ENROUTE_TO_DELIVERY') && (
             <Polyline
-              coordinates={[pickupLatLng, dropLatLng]}
+              coordinates={
+                tripRouteCoordinates.length > 0
+                  ? tripRouteCoordinates
+                  : [pickupLatLng, dropLatLng]
+              }
               strokeColor="#4CAF50"
-              strokeWidth={4}
+              strokeWidth={5}
             />
           )}
         </MapView>

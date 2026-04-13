@@ -5,30 +5,29 @@ import {
   TouchableOpacity,
   ScrollView,
   Image,
-  SafeAreaView,
   StatusBar,
   Dimensions,
   Animated,
   ActivityIndicator,
-  TextInput,
   Alert,
-  Platform,
   PanResponder,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
 import { useEffect, useState, useRef, useCallback } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import * as Haptics from 'expo-haptics';
 import * as Location from 'expo-location';
-import MapView, { Marker, PROVIDER_GOOGLE } from 'react-native-maps';
+import MapView, { Marker, Callout, PROVIDER_GOOGLE } from 'react-native-maps';
 import { vehiclesAPI } from '../services/vehiclesAPI';
-import { placesAPI, PlaceSuggestion } from '../services/placesAPI';
-import { io, Socket } from 'socket.io-client';
-import { SOCKET_URL } from '../lib/env';
+import { permanentDriversAPI } from '../services/permanentDriversAPI';
+import { socketManager } from '../services/socketManager';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { API_URL } from '../lib/env';
 import { useNotifications } from '../contexts/NotificationContext';
+import { useLanguage } from '../contexts/LanguageContext';
+import { useTrip } from '../contexts/TripContext';
 
 const { width, height } = Dimensions.get('window');
 
@@ -74,15 +73,22 @@ interface Driver {
   agriculturalExperience?: {
     years?: number;
   };
-  distance?: number; // Calculated distance for nearby sorting
+  distance?: number;
+  address?: string;
+  city?: string;
+  isPermanent?: boolean;
+  mobileNumber?: string;
+  isOnDuty?: boolean;
 }
 
 export default function Home() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const { t } = useLanguage();
   const { lastNotification: contextLastNotification } = useNotifications();
+  const { activeTrip, clearActiveTrip } = useTrip();
   const [lastNotification, setLastNotification] = useState<any | null>(null);
-  const [userEmail, setUserEmail] = useState('');
+  const [_userEmail, setUserEmail] = useState('');
   const [userName, setUserName] = useState('');
   const [profilePhoto, setProfilePhoto] = useState<string | null>(null);
   const [userLocation, setUserLocation] = useState<{ latitude: number; longitude: number } | null>(null);
@@ -94,25 +100,23 @@ export default function Home() {
   const [pickupLocation, setPickupLocation] = useState<string>('');
   const [pickupLocationCoords, setPickupLocationCoords] = useState<{ latitude: number; longitude: number } | null>(null);
   const [dropLocation, setDropLocation] = useState<string>('');
-  const [showBookingSheet, setShowBookingSheet] = useState(false);
-  const [socket, setSocket] = useState<Socket | null>(null);
   
   // Filters and search
   const [filteredDrivers, setFilteredDrivers] = useState<Driver[]>([]);
   const [selectedVehicleType, setSelectedVehicleType] = useState<string>('All');
-  const [pickupSearchQuery, setPickupSearchQuery] = useState<string>(''); // For searching pickup points
-  const [showSearchSuggestions, setShowSearchSuggestions] = useState(false);
-  const [searchSuggestions, setSearchSuggestions] = useState<PlaceSuggestion[]>([]);
-  const [searching, setSearching] = useState(false);
+
+  // 5-min countdown for PENDING/REQUESTED trip request banner (null=idle, 0=expired, >0=seconds left)
+  const [pendingSecondsLeft, setPendingSecondsLeft] = useState<number | null>(null);
   
   const mapRef = useRef<MapView>(null);
+  const locationWatchRef = useRef<Location.LocationSubscription | null>(null);
   
   // Bottom sheet animation values
   const COLLAPSED_HEIGHT = height * 0.3; // 30% of screen
   const EXPANDED_HEIGHT = height * 0.85; // 85% of screen (leaves some space at top)
   const bottomSheetAnim = useRef(new Animated.Value(COLLAPSED_HEIGHT)).current;
   const panY = useRef(new Animated.Value(0)).current; // Track pan gesture
-  const [isBottomSheetExpanded, setIsBottomSheetExpanded] = useState(false);
+  const [_isBottomSheetExpanded, setIsBottomSheetExpanded] = useState(false);
   const currentSheetHeight = useRef(COLLAPSED_HEIGHT); // Track current height for smooth transitions
   
   const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -120,11 +124,11 @@ export default function Home() {
   // PanResponder for dragging bottom sheet (industry standard implementation)
   const panResponder = useRef(
     PanResponder.create({
-      onStartShouldSetPanResponder: (evt) => {
+      onStartShouldSetPanResponder: (_evt) => {
         // Allow starting from anywhere on the sheet
         return true;
       },
-      onMoveShouldSetPanResponder: (evt, gestureState) => {
+      onMoveShouldSetPanResponder: (_evt, gestureState) => {
         // Only respond to vertical gestures (more vertical than horizontal)
         // Allow dragging from anywhere on the sheet
         // Lower threshold for better responsiveness
@@ -164,7 +168,6 @@ export default function Home() {
         const finalHeight = currentSheetHeight.current - gestureState.dy;
         const threshold = (COLLAPSED_HEIGHT + EXPANDED_HEIGHT) / 2;
         const velocity = gestureState.vy;
-        const distance = Math.abs(gestureState.dy);
         
         let targetHeight: number;
         let shouldExpand: boolean;
@@ -218,12 +221,23 @@ export default function Home() {
   useEffect(() => {
     loadUserInfo();
     requestLocationPermission();
-    initializeSocket();
     loadStoredLocations();
-    
+
+    // Use singleton socketManager for home-screen events (no per-mount socket)
+    const handleVehicleLocation = (data: any) => updateVehicleLocation(data);
+    const handleNewNotification = () => {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    };
+    socketManager.on('vehicle-location-updated', handleVehicleLocation);
+    socketManager.on('new-notification', handleNewNotification);
+
     return () => {
-      if (socket) {
-        socket.disconnect();
+      socketManager.off('vehicle-location-updated', handleVehicleLocation);
+      socketManager.off('new-notification', handleNewNotification);
+      if (locationWatchRef.current) {
+        locationWatchRef.current.remove();
+        locationWatchRef.current = null;
       }
     };
   }, []);
@@ -312,74 +326,9 @@ export default function Home() {
         clearInterval(intervalRef.current);
       }
     };
-  }, [pickupLocationCoords, userLocation, loadNearbyVehicles]);
+  }, [pickupLocationCoords, userLocation]); // loadNearbyVehicles captured by closure inside setTimeout/setInterval
 
-  const initializeSocket = async () => {
-    try {
-      // Get authentication token
-      const token = await AsyncStorage.getItem('userToken');
-      if (!token) {
-        console.log('⚠️ No token found, skipping Socket.IO connection');
-        return;
-      }
 
-      const newSocket = io(SOCKET_URL, {
-        transports: ['websocket'],
-        reconnection: true,
-        auth: {
-          token: token,
-        },
-      });
-
-      newSocket.on('connect', () => {
-        console.log('✅ Connected to Socket.IO (authenticated)');
-      });
-
-      newSocket.on('connect_error', async (error: any) => {
-        console.error('❌ Socket.IO connection error:', error);
-        
-        // Check if it's a token expiration error
-        if (error.message?.includes('expired') || error.message?.includes('Invalid or expired token')) {
-          console.log('⚠️ Token expired, clearing stored token');
-          await AsyncStorage.removeItem('userToken');
-          // Optionally redirect to login or show a message
-          Alert.alert(
-            'Session Expired',
-            'Your session has expired. Please log in again.',
-            [
-              {
-                text: 'OK',
-                onPress: () => {
-                  router.replace('/login');
-                }
-              }
-            ]
-          );
-        }
-      });
-
-      newSocket.on('disconnect', (reason) => {
-        console.log('❌ Disconnected from Socket.IO:', reason);
-      });
-
-      // Listen for vehicle location updates
-      newSocket.on('vehicle-location-updated', (data: any) => {
-        updateVehicleLocation(data);
-      });
-
-      // Listen for new notifications (in case customer is on home screen)
-      newSocket.on('new-notification', (data: any) => {
-        console.log('📬 New notification received on home screen:', data);
-        // Haptic feedback
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-        Haptics.impactAsync(Haptics.ImpactFeedbackType.Medium);
-      });
-
-      setSocket(newSocket);
-    } catch (error) {
-      console.error('Socket connection error:', error);
-    }
-  };
 
   const updateVehicleLocation = (data: any) => {
     setVehicles((prevVehicles) =>
@@ -406,34 +355,46 @@ export default function Home() {
         return;
       }
 
-      const location = await Location.getCurrentPositionAsync({});
-      const coords = {
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude,
+      // Get an immediate fix first so the map centers quickly
+      const initial = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.High,
+      });
+      const initialCoords = {
+        latitude: initial.coords.latitude,
+        longitude: initial.coords.longitude,
       };
-      setUserLocation(coords);
+      setUserLocation(initialCoords);
 
-      // Get address
-      const [address] = await Location.reverseGeocodeAsync(coords);
-      if (address) {
-        const addressString = `${address.street || ''} ${address.city || ''} ${address.region || ''}`.trim() ||
-          'Current Location';
-        setPickupLocation(addressString);
-        
-        // Only set as pickup location coords if no pickup location is already set
-        if (!pickupLocationCoords) {
-          setPickupLocationCoords(coords);
-        }
-      }
-
-      // Center map on user location only if no pickup location is set
-      if (mapRef.current && !pickupLocationCoords) {
+      // Center map on user's real position (do NOT set pickupLocationCoords here —
+      // the pickup marker should only appear when the user explicitly selects a location)
+      if (mapRef.current) {
         mapRef.current.animateToRegion({
-          ...coords,
+          ...initialCoords,
           latitudeDelta: 0.05,
           longitudeDelta: 0.05,
         }, 1000);
       }
+
+      // Stop any existing watcher before starting a new one
+      if (locationWatchRef.current) {
+        locationWatchRef.current.remove();
+      }
+
+      // Continuously watch GPS position so the map always shows correct location
+      locationWatchRef.current = await Location.watchPositionAsync(
+        {
+          accuracy: Location.Accuracy.High,
+          distanceInterval: 10, // update every 10 metres of movement
+          timeInterval: 5000,   // or at least every 5 seconds
+        },
+        (loc) => {
+          const coords = {
+            latitude: loc.coords.latitude,
+            longitude: loc.coords.longitude,
+          };
+          setUserLocation(coords);
+        },
+      );
     } catch (error) {
       console.error('Error getting location:', error);
       Alert.alert('Error', 'Failed to get your location. Please enable location services.');
@@ -481,70 +442,156 @@ export default function Home() {
     }
   }, [pickupLocationCoords, userLocation]);
 
-  // Load all registered drivers with filters
+
+  // Load all registered drivers + permanent drivers and merge into one list
   const loadAllDrivers = useCallback(async () => {
     try {
       setLoadingDrivers(true);
-      
-      // If pickup location is set, get nearby drivers first
-      let nearbyDrivers: Driver[] = [];
+
+      // Fetch regular drivers and permanent drivers in parallel.
+      // If pickup is set, use nearby endpoint (returns proximity-sorted drivers with GPS).
+      // Otherwise fall back to getAllDrivers (all ONLINE).
+      const searchLoc = pickupLocationCoords || userLocation;
+      const [regularRes, permRes] = await Promise.allSettled([
+        searchLoc
+          ? vehiclesAPI.getNearbyVehicles(searchLoc.latitude, searchLoc.longitude, 30,
+              selectedVehicleType !== 'All' ? selectedVehicleType : undefined)
+          : vehiclesAPI.getAllDrivers(100, 0, 'ONLINE'),
+        permanentDriversAPI.getAll(
+          selectedVehicleType !== 'All' ? { vehicleType: selectedVehicleType } : undefined
+        ),
+      ]);
+
+      // --- Regular drivers ---
+      // getNearbyVehicles returns { vehicleId, driverId, driverName, currentLocation:{lat,lng,address}, ... }
+      // getAllDrivers returns raw Driver objects with currentLocation.coordinates:[lng,lat]
+      // Normalise both to the Driver interface used by this screen.
+      let regularDrivers: Driver[] = [];
+      if (regularRes.status === 'fulfilled' && regularRes.value?.ok && regularRes.value?.data) {
+        const raw = regularRes.value.data;
+        if (searchLoc && Array.isArray(raw) && raw[0]?.driverName !== undefined) {
+          // From getNearbyVehicles — convert to Driver shape
+          regularDrivers = raw.map((v: any): Driver => ({
+            _id: v.driverId || v.vehicleId,
+            name: v.driverName,
+            phone: v.driverPhone,
+            profilePhoto: v.profilePhoto,
+            vehicleDetails: {
+              type: v.vehicleType || 'Unknown',
+              number: v.vehicleNumber || 'N/A',
+            },
+            rating: v.rating,
+            totalTrips: v.totalTrips,
+            status: v.status || 'ONLINE',
+            currentLocation: v.currentLocation
+              ? {
+                  type: 'Point',
+                  coordinates: [v.currentLocation.longitude, v.currentLocation.latitude] as [number, number],
+                  address: v.currentLocation.address,
+                }
+              : undefined,
+            distance: v.distance,
+          }));
+        } else {
+          // From getAllDrivers — already in Driver shape
+          regularDrivers = raw;
+        }
+      }
+
+      // --- Permanent drivers → normalise to Driver shape ---
+      let permDrivers: Driver[] = [];
+      if (permRes.status === 'fulfilled' && permRes.value?.ok && permRes.value?.data) {
+        permDrivers = permRes.value.data.drivers
+          .map((pd: any): Driver => ({
+            _id: pd._id,
+            name: pd.name,
+            profilePhoto: pd.profilePhoto || undefined,
+            vehicleDetails: {
+              type: pd.vehicleType,
+              number: pd.vehicleNumber || '',
+              imageUrl: pd.profilePhoto || undefined,
+            },
+            status: 'ONLINE',
+            city: pd.city,
+            address: pd.serviceArea || pd.city,
+            isPermanent: true,
+            mobileNumber: pd.mobileNumber,
+            isOnDuty: pd.isOnDuty !== false, // default true if field missing
+          }));
+      }
+
+      // Merge: regular drivers first (they have GPS), then permanent
+      let allDrivers: Driver[] = [...regularDrivers, ...permDrivers];
+
+      // Filter by vehicle type
+      if (selectedVehicleType !== 'All') {
+        allDrivers = allDrivers.filter(d =>
+          d.vehicleDetails?.type === selectedVehicleType
+        );
+      }
+
+      // Sort regular drivers with GPS by proximity to pickup
       if (pickupLocationCoords) {
-        try {
-          const nearbyResponse = await vehiclesAPI.getNearbyVehicles(
-            pickupLocationCoords.latitude,
-            pickupLocationCoords.longitude,
-            10 // 10km radius
-          );
-          if (nearbyResponse.ok && nearbyResponse.data) {
-            // Convert vehicle format to driver format for nearby results
-            // For now, we'll use all drivers and filter by location later
+        allDrivers = allDrivers.map(d => {
+          if (d.currentLocation?.coordinates) {
+            const [lon, lat] = d.currentLocation.coordinates;
+            return { ...d, distance: calculateDistance(pickupLocationCoords.latitude, pickupLocationCoords.longitude, lat, lon) };
           }
-        } catch (error) {
-          console.log('No nearby drivers found, showing all');
-        }
+          return { ...d, distance: Infinity };
+        }).sort((a: any, b: any) => (a.distance ?? Infinity) - (b.distance ?? Infinity));
       }
-      
-      // Get all drivers
-      const response = await vehiclesAPI.getAllDrivers(100, 0);
-      
-      if (response.ok && response.data) {
-        let allDrivers = response.data;
-        
-        // Filter by vehicle type if selected
-        if (selectedVehicleType !== 'All') {
-          allDrivers = allDrivers.filter(driver => 
-            driver.vehicleDetails?.type === selectedVehicleType
-          );
-        }
-        
-        // If pickup location is set, prioritize nearby drivers
-        if (pickupLocationCoords) {
-          // Calculate distance and sort by proximity
-          allDrivers = allDrivers.map(driver => {
-            if (driver.currentLocation?.coordinates) {
-              const [lon, lat] = driver.currentLocation.coordinates;
-              const distance = calculateDistance(
-                pickupLocationCoords.latitude,
-                pickupLocationCoords.longitude,
-                lat,
-                lon
-              );
-              return { ...driver, distance };
-            }
-            return { ...driver, distance: Infinity };
-          }).sort((a: any, b: any) => (a.distance || Infinity) - (b.distance || Infinity));
-        }
-        
-        setDrivers(allDrivers);
-        applyFilters(allDrivers);
-        console.log(`✅ Loaded ${allDrivers.length} drivers`);
-      }
+
+      setDrivers(allDrivers);
+      applyFilters(allDrivers);
+      console.log(`✅ Loaded ${regularDrivers.length} regular + ${permDrivers.length} permanent drivers`);
     } catch (error: any) {
       console.error('Error loading drivers:', error);
     } finally {
       setLoadingDrivers(false);
     }
-  }, [pickupLocationCoords, selectedVehicleType]);
+  }, [pickupLocationCoords, userLocation, selectedVehicleType]);
+
+  // 5-minute countdown for PENDING/REQUESTED trip request banner
+  useEffect(() => {
+    const FIVE_MIN_S = 5 * 60;
+    const isPending = activeTrip && ['PENDING', 'REQUESTED'].includes(activeTrip.currentTripState);
+
+    if (!isPending) {
+      setPendingSecondsLeft(null);
+      return;
+    }
+
+    // Use trip createdAt to correctly resume countdown after app restart
+    const createdMs = activeTrip.createdAt
+      ? new Date(activeTrip.createdAt).getTime()
+      : Date.now();
+    const elapsed = Math.floor((Date.now() - createdMs) / 1000);
+    const remaining = Math.max(0, FIVE_MIN_S - elapsed);
+
+    setPendingSecondsLeft(remaining);
+    if (remaining === 0) return;
+
+    const interval = setInterval(() => {
+      setPendingSecondsLeft(prev => {
+        if (prev === null || prev <= 1) {
+          clearInterval(interval);
+          // Timer expired — the driver didn't respond in time. Clear the stale trip
+          // so the banner doesn't reappear on the next app launch.
+          clearActiveTrip();
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [activeTrip?._id, activeTrip?.currentTripState]);
+
+  const formatCountdown = (secs: number) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
 
   // Calculate distance between two coordinates (Haversine formula)
   const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number): number => {
@@ -573,83 +620,6 @@ export default function Home() {
     setFilteredDrivers(filtered);
   };
 
-  // Handle search for pickup points (debounced)
-  const handleSearchPickupPoints = async (query: string) => {
-    if (searchTimeoutRef.current) {
-      clearTimeout(searchTimeoutRef.current);
-    }
-    
-    if (query.trim().length < 2) {
-      setSearchSuggestions([]);
-      setShowSearchSuggestions(false);
-      setSearching(false);
-      return;
-    }
-    
-    setSearching(true);
-    setShowSearchSuggestions(true);
-    
-    searchTimeoutRef.current = setTimeout(async () => {
-      try {
-        const location = pickupLocationCoords || userLocation;
-        const response = await placesAPI.getAutocomplete(
-          query,
-          location ? { latitude: location.latitude, longitude: location.longitude } : undefined,
-          10000 // 10km radius
-        );
-        
-        if (response.ok && response.data) {
-          setSearchSuggestions(response.data);
-        }
-      } catch (error: any) {
-        console.error('Error searching pickup points:', error);
-        setSearchSuggestions([]);
-      } finally {
-        setSearching(false);
-      }
-    }, 300); // 300ms debounce
-  };
-
-  // Handle pickup point selection
-  const handleSelectPickupPoint = async (suggestion: PlaceSuggestion) => {
-    try {
-      const response = await placesAPI.getPlaceDetails(suggestion.placeId);
-      if (response.ok && response.data) {
-        const place = response.data;
-        setPickupLocation(place.address);
-        setPickupLocationCoords({
-          latitude: place.latitude,
-          longitude: place.longitude,
-        });
-        setPickupSearchQuery('');
-        setShowSearchSuggestions(false);
-        
-        // Store pickup location
-        await AsyncStorage.setItem('pickupLocation', JSON.stringify({
-          address: place.address,
-          latitude: place.latitude,
-          longitude: place.longitude,
-        }));
-        
-        // Center map on pickup location
-        if (mapRef.current) {
-          mapRef.current.animateToRegion({
-            latitude: place.latitude,
-            longitude: place.longitude,
-            latitudeDelta: 0.05,
-            longitudeDelta: 0.05,
-          }, 1000);
-        }
-        
-        // Reload drivers with new pickup location
-        setTimeout(() => {
-          loadAllDrivers();
-        }, 500);
-      }
-    } catch (error: any) {
-      console.error('Error getting place details:', error);
-    }
-  };
 
   // Update filters when they change
   useEffect(() => {
@@ -660,9 +630,7 @@ export default function Home() {
   
   // Load drivers when pickup location or filters change
   useEffect(() => {
-    if (pickupLocationCoords || userLocation) {
-      loadAllDrivers();
-    }
+    loadAllDrivers();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pickupLocationCoords, selectedVehicleType, userLocation]);
   
@@ -792,7 +760,7 @@ export default function Home() {
       }
       
       // Ensure API_URL is defined
-      const apiUrl = API_URL || 'http://192.168.12.81:5000';
+      const apiUrl = API_URL || 'http://192.168.12.83:5000';
       
       // Create timeout controller
       const controller = new AbortController();
@@ -888,17 +856,9 @@ export default function Home() {
     } finally {
       fetchingUserNameRef.current = false;
     }
+    return null;
   };
 
-  const handleLogout = async () => {
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    await AsyncStorage.removeItem('userToken');
-    await AsyncStorage.removeItem('userEmail');
-    await AsyncStorage.removeItem('userId');
-    await AsyncStorage.removeItem('userName');
-    if (socket) socket.disconnect();
-    router.replace('/login');
-  };
 
   const handleBookRide = async () => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -948,9 +908,9 @@ export default function Home() {
   const handleVehicleSelect = (vehicle: Vehicle) => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     setSelectedVehicle(vehicle);
-    
+
     // Animate map to vehicle location
-    if (mapRef.current) {
+    if (mapRef.current && vehicle.currentLocation) {
       mapRef.current.animateToRegion({
         latitude: vehicle.currentLocation.latitude,
         longitude: vehicle.currentLocation.longitude,
@@ -1040,15 +1000,92 @@ export default function Home() {
           </View>
         </TouchableOpacity>
       )}
-      
+
+      {/* Active Trip Banner */}
+      {(() => {
+        if (!activeTrip) return null;
+        const st = activeTrip.currentTripState;
+        if (['COMPLETED','CANCELLED','CUSTOMER_CANCELLED','DRIVER_CANCELLED','REJECTED'].includes(st)) return null;
+        if (pendingSecondsLeft === 0 && ['PENDING','REQUESTED','NEW'].includes(st)) return null;
+
+        const otpCode = activeTrip.otp || activeTrip.pickupCode;
+        // Hide OTP as soon as it has been verified, even if trip state hasn't updated yet
+        const showOtpInBanner = ['ACCEPTED','ENROUTE_TO_PICKUP','EN_ROUTE_TO_PICKUP','ARRIVED_AT_PICKUP'].includes(st)
+          && !!otpCode
+          && !activeTrip.otpVerified;
+
+        // Per-state config
+        const cfg: Record<string, { bg: string; icon: string; title: string; sub: string; action: string }> = {
+          NEW:                    { bg: '#B45309', icon: 'hourglass-top',    title: 'Finding Your Driver',       sub: `Searching nearby drivers…${pendingSecondsLeft && pendingSecondsLeft > 0 ? ` (${formatCountdown(pendingSecondsLeft)} left)` : ''}`,        action: 'View' },
+          PENDING:                { bg: '#B45309', icon: 'hourglass-top',    title: 'Finding Your Driver',       sub: `Searching nearby drivers…${pendingSecondsLeft && pendingSecondsLeft > 0 ? ` (${formatCountdown(pendingSecondsLeft)} left)` : ''}`,        action: 'View' },
+          REQUESTED:              { bg: '#B45309', icon: 'hourglass-top',    title: 'Awaiting Driver Response',  sub: `Driver reviewing your request…${pendingSecondsLeft && pendingSecondsLeft > 0 ? ` (${formatCountdown(pendingSecondsLeft)} left)` : ''}`,   action: 'View' },
+          NEGOTIATING:            { bg: '#D97706', icon: 'chat',             title: 'Negotiation in Progress',   sub: 'Driver sent an offer — tap to respond',                                                                                                   action: 'Chat' },
+          ACCEPTED:               { bg: '#16A34A', icon: 'directions-car',   title: 'Driver Accepted!',          sub: showOtpInBanner ? `On the way · Pickup Code: ${otpCode}` : 'Driver is on the way to you',                                                 action: 'Track' },
+          ENROUTE_TO_PICKUP:      { bg: '#1D4ED8', icon: 'directions-car',   title: 'Driver Heading to You',     sub: showOtpInBanner ? `Live tracking · Code: ${otpCode}` : 'Track driver on map',                                                             action: 'Track' },
+          EN_ROUTE_TO_PICKUP:     { bg: '#1D4ED8', icon: 'directions-car',   title: 'Driver Heading to You',     sub: showOtpInBanner ? `Live tracking · Code: ${otpCode}` : 'Track driver on map',                                                             action: 'Track' },
+          ARRIVED_AT_PICKUP:      { bg: '#C2410C', icon: 'location-on',      title: 'Driver Has Arrived!',       sub: showOtpInBanner ? `Show Code ${otpCode} to driver` : 'Driver is at pickup point',                                                         action: 'Show Code' },
+          PICKUP_VERIFIED:        { bg: '#7C3AED', icon: 'inventory',        title: 'Goods Picked Up',           sub: 'Your goods are with the driver — tap to track',                                                                                           action: 'Track' },
+          PICKED_UP:              { bg: '#7C3AED', icon: 'inventory',        title: 'Goods Picked Up',           sub: 'Driver heading to delivery point — tap to track',                                                                                         action: 'Track' },
+          IN_TRANSIT:             { bg: '#0369A1', icon: 'local-shipping',   title: 'Goods in Transit',          sub: 'En route to delivery — tap to track live',                                                                                                action: 'Track' },
+          ENROUTE_TO_DELIVERY:    { bg: '#0369A1', icon: 'local-shipping',   title: 'Goods in Transit',          sub: 'Driver heading to delivery point — tap to track',                                                                                         action: 'Track' },
+          ARRIVED_AT_DELIVERY:    { bg: '#0F766E', icon: 'place',            title: 'Driver at Delivery Point',  sub: 'Your goods are being delivered',                                                                                                          action: 'Track' },
+          DELIVERING:             { bg: '#0F766E', icon: 'move-to-inbox',    title: 'Delivering Your Goods',     sub: 'Almost there — tap to track',                                                                                                             action: 'Track' },
+          ARRIVED_AT_DROPOFF:     { bg: '#0F766E', icon: 'place',            title: 'Delivery Point Reached',    sub: 'Driver completing delivery',                                                                                                              action: 'Track' },
+        };
+        const c = cfg[st] || { bg: '#16A34A', icon: 'local-shipping', title: 'Trip in Progress', sub: 'Tap to track your shipment', action: 'Track' };
+
+        return (
+          <TouchableOpacity
+            style={[styles.activeTripBanner, { top: insets.top + 10, backgroundColor: c.bg, shadowColor: c.bg }]}
+            onPress={() => {
+              if (st === 'NEGOTIATING') {
+                router.replace({ pathname: '/trip-negotiation', params: { tripId: activeTrip._id } });
+              } else if (['NEW','PENDING','REQUESTED'].includes(st)) {
+                // Reconnect to the searching screen at correct phase (wave timer not reset)
+                router.replace({ pathname: '/searching-drivers', params: { tripId: activeTrip._id } });
+              } else {
+                router.replace({ pathname: '/trip-tracking', params: { id: activeTrip._id } });
+              }
+            }}
+            activeOpacity={0.9}
+          >
+            <View style={styles.activeTripBannerLeft}>
+              <View style={styles.activeTripPulse}>
+                <Icon name={c.icon} size={18} color="#fff" />
+              </View>
+              <View style={{ flex: 1, marginLeft: 10 }}>
+                <Text style={styles.activeTripBannerTitle}>{c.title}</Text>
+                {showOtpInBanner && st === 'ARRIVED_AT_PICKUP' ? (
+                  <View style={styles.activeTripOtpRow}>
+                    <Text style={styles.activeTripOtpLabel}>Show Code </Text>
+                    <Text style={styles.activeTripOtpCode}>{otpCode}</Text>
+                    <Text style={styles.activeTripOtpLabel}> to driver</Text>
+                  </View>
+                ) : (
+                  <Text style={styles.activeTripBannerSub} numberOfLines={1}>{c.sub}</Text>
+                )}
+              </View>
+            </View>
+            <View style={styles.activeTripBannerRight}>
+              <Text style={styles.activeTripBannerTrack}>{c.action}</Text>
+              <Icon name="chevron-right" size={18} color="#fff" />
+            </View>
+          </TouchableOpacity>
+        );
+      })()}
+
       {/* Top Header */}
       <View style={styles.header}>
         <View style={styles.headerTop}>
-          <View style={styles.userInfo}>
+          <TouchableOpacity
+            style={styles.userInfo}
+            onPress={() => router.push('/(tabs)/profile')}
+            activeOpacity={0.7}
+          >
             <View style={styles.avatarContainer}>
               {profilePhoto ? (
-                <Image 
-                  source={{ uri: profilePhoto }} 
+                <Image
+                  source={{ uri: profilePhoto }}
                   style={styles.avatarImage}
                   onError={() => {
                     console.log('[Home] ⚠️ Failed to load profile photo, using fallback');
@@ -1060,12 +1097,12 @@ export default function Home() {
               )}
             </View>
             <View style={styles.userDetails}>
-              <Text style={styles.greeting}>Hello</Text>
+              <Text style={styles.greeting}>{t.home.hello}</Text>
               <Text style={styles.userName} numberOfLines={1}>
                 {userName && userName.trim() ? userName.trim() : 'User'}
               </Text>
             </View>
-          </View>
+          </TouchableOpacity>
         </View>
 
         {/* Location Search Bar */}
@@ -1080,9 +1117,9 @@ export default function Home() {
             <Icon name="location-on" size={20} color="#4CAF50" />
           </View>
           <View style={styles.locationTextContainer}>
-            <Text style={styles.locationLabel}>Pickup Location</Text>
+            <Text style={styles.locationLabel}>{t.home.pickupLocation}</Text>
             <Text style={[styles.locationText, !pickupLocation && styles.placeholderText]} numberOfLines={1}>
-              {pickupLocation || 'Where from?'}
+              {pickupLocation || t.home.whereFrom}
             </Text>
           </View>
           <Icon name="chevron-right" size={20} color="#999" />
@@ -1100,9 +1137,9 @@ export default function Home() {
             <Icon name="place" size={20} color="#FF9800" />
           </View>
           <View style={styles.locationTextContainer}>
-            <Text style={styles.locationLabel}>Drop Location</Text>
+            <Text style={styles.locationLabel}>{t.home.dropLocation}</Text>
             <Text style={[styles.locationText, !dropLocation && styles.placeholderText]} numberOfLines={1}>
-              {dropLocation || 'Where to?'}
+              {dropLocation || t.home.whereTo}
             </Text>
           </View>
           <Icon name="chevron-right" size={20} color="#999" />
@@ -1122,7 +1159,7 @@ export default function Home() {
               latitudeDelta: 0.05,
               longitudeDelta: 0.05,
             }}
-            showsUserLocation={!pickupLocationCoords} // Only show user location if no pickup location set
+            showsUserLocation={true}
             showsMyLocationButton={false}
             mapType="standard"
           >
@@ -1149,35 +1186,78 @@ export default function Home() {
               />
             )}
 
-            {/* Vehicle Markers */}
-            {vehicles.map((vehicle) => (
-              <Marker
-                key={vehicle.vehicleId}
-                coordinate={{
-                  latitude: vehicle.currentLocation.latitude,
-                  longitude: vehicle.currentLocation.longitude,
-                }}
-                title={`${vehicle.driverName} - ${vehicle.vehicleType}`}
-                description={`${vehicle.distance.toFixed(1)} km away • ₹${vehicle.costPerKm}/km`}
-                onPress={() => handleVehicleSelect(vehicle)}
-              >
-                <View
-                  style={[
-                    styles.vehicleMarker,
-                    {
-                      backgroundColor: getVehicleColor(vehicle.vehicleType),
-                      borderColor: selectedVehicle?.vehicleId === vehicle.vehicleId ? '#fff' : 'transparent',
-                    },
-                  ]}
+            {/* Online Driver Markers — yellow pin + address callout */}
+            {filteredDrivers
+              .filter(d => d.currentLocation?.coordinates)
+              .map((driver) => {
+                const [lon, lat] = driver.currentLocation!.coordinates;
+                const vehicleType = driver.vehicleDetails?.type || 'Tempo';
+                const address = driver.currentLocation?.address
+                  || (driver.address && driver.city ? `${driver.address}, ${driver.city}` : null)
+                  || driver.city
+                  || 'On duty';
+                return (
+                  <Marker
+                    key={`driver-${driver._id}`}
+                    coordinate={{ latitude: lat, longitude: lon }}
+                    tracksViewChanges={false}
+                  >
+                    <View style={[styles.vehicleMarker, { backgroundColor: '#FFC107' }]}>
+                      <Icon name={getVehicleIcon(vehicleType)} size={22} color="#fff" />
+                    </View>
+                    <Callout tooltip={false}>
+                      <View style={styles.driverCallout}>
+                        <Text style={styles.driverCalloutType}>{vehicleType}</Text>
+                        <View style={styles.driverCalloutAddressRow}>
+                          <Icon name="location-on" size={12} color="#4CAF50" />
+                          <Text style={styles.driverCalloutAddress} numberOfLines={2}>
+                            {address}
+                          </Text>
+                        </View>
+                      </View>
+                    </Callout>
+                  </Marker>
+                );
+              })
+            }
+
+            {/* Nearby vehicle markers for drivers NOT already in filteredDrivers */}
+            {vehicles
+              .filter(v => v.currentLocation !== null) // skip drivers without GPS
+              .filter(v => !filteredDrivers.some(d =>
+                d.currentLocation?.coordinates &&
+                Math.abs(d.currentLocation.coordinates[1] - v.currentLocation!.latitude) < 0.0001 &&
+                Math.abs(d.currentLocation.coordinates[0] - v.currentLocation!.longitude) < 0.0001
+              ))
+              .map((vehicle) => (
+                <Marker
+                  key={vehicle.vehicleId}
+                  coordinate={{
+                    latitude: vehicle.currentLocation!.latitude,
+                    longitude: vehicle.currentLocation!.longitude,
+                  }}
+                  tracksViewChanges={false}
+                  onPress={() => handleVehicleSelect(vehicle)}
                 >
-                  <Icon
-                    name={getVehicleIcon(vehicle.vehicleType)}
-                    size={24}
-                    color="#fff"
-                  />
-                </View>
-              </Marker>
-            ))}
+                  <View style={[styles.vehicleMarker, { backgroundColor: '#FFC107', borderColor: selectedVehicle?.vehicleId === vehicle.vehicleId ? '#fff' : 'transparent' }]}>
+                    <Icon name={getVehicleIcon(vehicle.vehicleType)} size={24} color="#fff" />
+                  </View>
+                  <Callout tooltip={false}>
+                    <View style={styles.driverCallout}>
+                      <Text style={styles.driverCalloutType}>{vehicle.vehicleType}</Text>
+                      {vehicle.currentLocation!.address && vehicle.currentLocation!.address !== 'Location not available' ? (
+                        <View style={styles.driverCalloutAddressRow}>
+                          <Icon name="location-on" size={12} color="#4CAF50" />
+                          <Text style={styles.driverCalloutAddress} numberOfLines={2}>
+                            {vehicle.currentLocation!.address}
+                          </Text>
+                        </View>
+                      ) : null}
+                    </View>
+                  </Callout>
+                </Marker>
+              ))
+            }
           </MapView>
         ) : (
           <View style={styles.mapPlaceholder}>
@@ -1187,7 +1267,7 @@ export default function Home() {
         )}
 
         {/* Map Controls */}
-        <View style={[styles.mapControls, { bottom: Platform.OS === 'android' ? insets.bottom + 90 : insets.bottom + 100 }]}>
+        <View style={[styles.mapControls, { bottom: 16 }]}>
           <TouchableOpacity style={styles.mapControlButton} onPress={handleMyLocation}>
             <Icon name="my-location" size={24} color="#4CAF50" />
           </TouchableOpacity>
@@ -1208,126 +1288,66 @@ export default function Home() {
           styles.bottomSheet,
           {
             height: bottomSheetAnim,
-            bottom: Platform.OS === 'android' ? insets.bottom + 70 : insets.bottom + 85, // Account for tab bar + system nav
           },
         ]}
-        {...panResponder.panHandlers}
       >
         <View style={styles.bottomSheetContent}>
-          <View style={styles.bottomSheetHeader}>
-            <Text style={styles.bottomSheetTitle}>
-              Available Vehicles ({filteredDrivers.length})
-            </Text>
-            <TouchableOpacity
-              onPress={() => {
-                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                loadAllDrivers();
-              }}
-            >
-              <Icon name="refresh" size={24} color="#4CAF50" />
-            </TouchableOpacity>
-          </View>
 
-          {/* Filters and Search Bar */}
-          <View style={styles.filtersContainer}>
-          {/* Search Bar for Pickup Points */}
-          <View style={styles.searchBarContainer}>
-            <Icon name="search" size={20} color="#666" style={styles.searchIcon} />
-            <TextInput
-              style={styles.searchInput}
-              placeholder="Search pickup points..."
-              placeholderTextColor="#999"
-              value={pickupSearchQuery}
-              onChangeText={(text) => {
-                setPickupSearchQuery(text);
-                handleSearchPickupPoints(text);
-              }}
-              onFocus={() => {
-                if (pickupSearchQuery.length >= 2) {
-                  setShowSearchSuggestions(true);
-                }
-              }}
-            />
-            {pickupSearchQuery.length > 0 && (
+          {/* ── Sticky header zone: handle + title + filter ── */}
+          <View style={styles.sheetHeaderZone} {...panResponder.panHandlers}>
+            {/* Drag handle */}
+            <View style={styles.bottomSheetHandle} />
+
+            {/* Title row */}
+            <View style={styles.bottomSheetHeader}>
+              <Text style={styles.bottomSheetTitle}>
+                Available Vehicles
+              </Text>
               <TouchableOpacity
-                onPress={() => {
-                  setPickupSearchQuery('');
-                  setShowSearchSuggestions(false);
-                  setSearchSuggestions([]);
-                }}
-                style={styles.clearSearchButton}
-              >
-                <Icon name="close" size={18} color="#666" />
-              </TouchableOpacity>
-            )}
-          </View>
-
-          {/* Search Suggestions Dropdown */}
-          {showSearchSuggestions && searchSuggestions.length > 0 && (
-            <View style={styles.suggestionsContainer}>
-              <ScrollView style={styles.suggestionsList} nestedScrollEnabled>
-                {searchSuggestions.map((suggestion, index) => (
-                  <TouchableOpacity
-                    key={index}
-                    style={styles.suggestionItem}
-                    onPress={() => handleSelectPickupPoint(suggestion)}
-                  >
-                    <Icon name="place" size={20} color="#4CAF50" />
-                    <View style={styles.suggestionText}>
-                      <Text style={styles.suggestionMainText} numberOfLines={1}>
-                        {suggestion.mainText}
-                      </Text>
-                      <Text style={styles.suggestionSecondaryText} numberOfLines={1}>
-                        {suggestion.secondaryText}
-                      </Text>
-                    </View>
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-            </View>
-          )}
-
-          {/* Vehicle Type Filter */}
-          <ScrollView 
-            horizontal 
-            showsHorizontalScrollIndicator={false}
-            style={styles.filterScroll}
-            contentContainerStyle={styles.filterContainer}
-          >
-            {['All', 'Tempo', 'Pickup', 'Tata Ace', 'Bolero Pickup', 'Eicher Mini', 'Mini Truck'].map((type) => (
-              <TouchableOpacity
-                key={type}
-                style={[
-                  styles.filterChip,
-                  selectedVehicleType === type && styles.filterChipActive,
-                ]}
                 onPress={() => {
                   Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                  setSelectedVehicleType(type);
+                  loadAllDrivers();
                 }}
               >
-                <Text
-                  style={[
-                    styles.filterChipText,
-                    selectedVehicleType === type && styles.filterChipTextActive,
-                  ]}
-                >
-                  {type}
-                </Text>
+                <Icon name="refresh" size={24} color="#16a34a" />
               </TouchableOpacity>
-            ))}
-          </ScrollView>
+            </View>
+
+            {/* Filter chips */}
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              style={styles.filterScroll}
+              contentContainerStyle={styles.filterContainer}
+            >
+              {['All', 'Tempo', 'Pickup', 'Tata Ace', 'Bolero Pickup', 'Eicher Mini', 'Mini Truck'].map((type) => (
+                <TouchableOpacity
+                  key={type}
+                  style={[styles.filterChip, selectedVehicleType === type && styles.filterChipActive]}
+                  onPress={() => {
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                    setSelectedVehicleType(type);
+                  }}
+                >
+                  <Text style={[styles.filterChipText, selectedVehicleType === type && styles.filterChipTextActive]}>
+                    {type}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
           </View>
 
+          {/* ── Content area: fills all remaining space ── */}
+          <View style={styles.sheetContentArea}>
         {loadingDrivers ? (
           <View style={styles.emptyState}>
-            <ActivityIndicator size="large" color="#4CAF50" />
+            <ActivityIndicator size="large" color="#16a34a" />
             <Text style={styles.emptyStateText}>Loading drivers...</Text>
           </View>
         ) : filteredDrivers.length === 0 ? (
           <View style={styles.emptyState}>
             <Icon name="directions-car" size={48} color="#ccc" />
-            <Text style={styles.emptyStateText}>No drivers available</Text>
+            <Text style={styles.emptyStateText}>{t.home.noDriversNearby}</Text>
             <Text style={styles.emptyStateSubtext}>
               {selectedVehicleType !== 'All' ? `Try changing the vehicle type filter` : 'Check back later'}
             </Text>
@@ -1346,68 +1366,70 @@ export default function Home() {
                 style={styles.driverCard}
                 onPress={() => {
                   Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                  router.push({
-                    pathname: '/driver-detail',
-                    params: { driverId: driver._id },
-                  });
+                  if (driver.isPermanent) {
+                    router.push({
+                      pathname: '/permanent-driver-detail',
+                      params: { id: driver._id },
+                    });
+                  } else {
+                    router.push({
+                      pathname: '/driver-detail',
+                      params: { driverId: driver._id },
+                    });
+                  }
                 }}
                 activeOpacity={0.7}
               >
                 {/* Vehicle Image */}
-                {driver.vehicleDetails?.imageUrl ? (
-                  <Image
-                    source={{ uri: driver.vehicleDetails.imageUrl }}
-                    style={styles.driverVehicleImage}
-                    resizeMode="cover"
-                  />
-                ) : (
-                  <View style={[styles.driverVehicleImagePlaceholder, { backgroundColor: `${getVehicleColor(driver.vehicleDetails?.type || 'Tempo')}20` }]}>
-                    <Icon
-                      name={getVehicleIcon(driver.vehicleDetails?.type || 'Tempo')}
-                      size={40}
-                      color={getVehicleColor(driver.vehicleDetails?.type || 'Tempo')}
+                <View>
+                  {driver.vehicleDetails?.imageUrl ? (
+                    <Image
+                      source={{ uri: driver.vehicleDetails.imageUrl }}
+                      style={styles.driverVehicleImage}
+                      resizeMode="cover"
                     />
-                  </View>
-                )}
-
-                {/* Vehicle Info - Show Vehicle Name instead of Driver Name */}
-                <View style={styles.driverCardContent}>
-                  <View style={styles.driverCardNameRow}>
-                    <Text style={styles.driverCardName} numberOfLines={1}>
-                      {driver.vehicleDetails?.type || 'Tempo'}
-                    </Text>
-                    {/* Status Indicator Dot */}
-                    <View
-                      style={[
-                        styles.statusDot,
-                        {
-                          backgroundColor:
-                            driver.status === 'ONLINE' ? '#4CAF50' : '#f44336',
-                        },
-                      ]}
-                    />
-                  </View>
-                  <Text style={styles.driverCardVehicleType} numberOfLines={2}>
-                    {driver.status === 'ONLINE' && driver.currentLocation?.address
-                      ? driver.currentLocation.address
-                      : driver.status !== 'ONLINE' && driver.address && driver.city
-                      ? `${driver.address}, ${driver.city}`
-                      : driver.address
-                      ? driver.address
-                      : driver.city
-                      ? driver.city
-                      : 'Location not available'}
-                  </Text>
-                  {driver.distance !== undefined && driver.distance < Infinity && (
-                    <Text style={styles.driverCardDistance} numberOfLines={1}>
-                      {driver.distance.toFixed(1)} km away
-                    </Text>
+                  ) : (
+                    <View style={[styles.driverVehicleImagePlaceholder, { backgroundColor: `${getVehicleColor(driver.vehicleDetails?.type || 'Tempo')}20` }]}>
+                      <Icon
+                        name={getVehicleIcon(driver.vehicleDetails?.type || 'Tempo')}
+                        size={40}
+                        color={getVehicleColor(driver.vehicleDetails?.type || 'Tempo')}
+                      />
+                    </View>
                   )}
-                  {driver.rating !== undefined && driver.rating > 0 && (
-                    <View style={styles.driverCardRating}>
-                      <Icon name="star" size={14} color="#FFD600" />
-                      <Text style={styles.driverCardRatingText}>
-                        {driver.rating.toFixed(1)}
+                  {/* Duty status dot — green for online/on-duty, red for off-duty (permanent only) */}
+                  <View style={[
+                    styles.dutyDot,
+                    {
+                      backgroundColor: driver.isPermanent
+                        ? (driver.isOnDuty !== false ? '#16A34A' : '#EF4444')
+                        : '#16A34A', // regular drivers only appear when ONLINE so always green
+                    },
+                  ]} />
+                </View>
+
+                {/* Vehicle Info */}
+                <View style={styles.driverCardContent}>
+                  <Text style={styles.driverCardName} numberOfLines={1}>
+                    {driver.vehicleDetails?.type || 'Tempo'}
+                  </Text>
+                  <View style={styles.driverCardLocationRow}>
+                    <Icon name="location-on" size={12} color="#4CAF50" />
+                    <Text style={styles.driverCardVehicleType} numberOfLines={2}>
+                      {driver.currentLocation?.address
+                        ? driver.currentLocation.address
+                        : driver.address && driver.city
+                        ? `${driver.address}, ${driver.city}`
+                        : driver.address || driver.city || 'On duty'}
+                    </Text>
+                  </View>
+
+                  {/* Contact row — permanent drivers only */}
+                  {driver.isPermanent && driver.mobileNumber && (
+                    <View style={styles.driverCardContactRow}>
+                      <Icon name="phone" size={11} color="#16A34A" />
+                      <Text style={styles.driverCardContactText} numberOfLines={1}>
+                        {driver.mobileNumber}
                       </Text>
                     </View>
                   )}
@@ -1416,13 +1438,14 @@ export default function Home() {
             ))}
           </ScrollView>
         )}
+          </View>{/* end sheetContentArea */}
         </View>
       </Animated.View>
 
       {/* Floating Action Button - Book Ride */}
       {dropLocation && (
         <TouchableOpacity
-          style={[styles.fab, { bottom: Platform.OS === 'android' ? insets.bottom + 90 : insets.bottom + 100 }]}
+          style={[styles.fab, { bottom: 100 }]}
           onPress={handleBookRide}
           activeOpacity={0.9}
         >
@@ -1652,31 +1675,34 @@ const styles = StyleSheet.create({
     flex: 1,
     flexDirection: 'column',
   },
+  sheetHeaderZone: {
+    flexShrink: 0,
+    backgroundColor: '#fff',
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f0f0',
+  },
+  sheetContentArea: {
+    flex: 1,
+  },
   bottomSheetHandle: {
     width: 40,
     height: 4,
-    backgroundColor: '#ddd',
+    backgroundColor: '#d1d5db',
     borderRadius: 2,
     alignSelf: 'center',
-    marginTop: 12,
-    marginBottom: 8,
-    paddingVertical: 12,
-    paddingHorizontal: 20,
-    // Make handle area larger for easier dragging
-    minHeight: 28,
-    justifyContent: 'center',
-    alignItems: 'center',
+    marginTop: 10,
+    marginBottom: 6,
   },
   bottomSheetHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingTop: 15,
-    paddingBottom: 12,
+    paddingHorizontal: 16,
+    paddingTop: 2,
+    paddingBottom: 8,
   },
   bottomSheetTitle: {
-    fontSize: 18,
+    fontSize: 16,
     fontWeight: '700',
     color: '#1a1a1a',
   },
@@ -1690,38 +1716,37 @@ const styles = StyleSheet.create({
   driversGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    padding: 12,
-    paddingTop: 0,
-    paddingBottom: 20,
-    justifyContent: 'space-between',
+    paddingHorizontal: 10,
+    paddingTop: 6,
+    paddingBottom: 12,
+    gap: 8,
   },
   driverCard: {
-    width: (width - 48) / 2, // 2 cards per row with padding
+    width: (width - 28) / 2,
     backgroundColor: '#fff',
-    borderRadius: 16,
+    borderRadius: 14,
     overflow: 'hidden',
-    marginBottom: 12,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
     borderWidth: 1,
     borderColor: '#f0f0f0',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.07,
+    shadowRadius: 6,
+    elevation: 3,
   },
   driverVehicleImage: {
     width: '100%',
-    height: 120,
+    height: 100,
     backgroundColor: '#f5f5f5',
   },
   driverVehicleImagePlaceholder: {
     width: '100%',
-    height: 120,
+    height: 100,
     justifyContent: 'center',
     alignItems: 'center',
   },
   driverCardContent: {
-    padding: 12,
+    padding: 8,
   },
   driverCardNameRow: {
     flexDirection: 'row',
@@ -1740,11 +1765,16 @@ const styles = StyleSheet.create({
     height: 8,
     borderRadius: 4,
   },
+  driverCardLocationRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 3,
+    marginTop: 4,
+  },
   driverCardVehicleType: {
-    fontSize: 13,
-    fontWeight: '500',
+    fontSize: 12,
     color: '#666',
-    marginBottom: 2,
+    flex: 1,
   },
   driverCardVehicleNumber: {
     fontSize: 12,
@@ -1766,6 +1796,32 @@ const styles = StyleSheet.create({
     color: '#4CAF50',
     fontWeight: '600',
     marginTop: 2,
+  },
+  dutyDot: {
+    position: 'absolute',
+    top: 6,
+    right: 6,
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: '#fff',
+  },
+  driverCardContactRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginTop: 6,
+    backgroundColor: '#F0FDF4',
+    borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+  },
+  driverCardContactText: {
+    fontSize: 11,
+    color: '#16A34A',
+    fontWeight: '600',
+    flex: 1,
   },
   filtersContainer: {
     paddingHorizontal: 20,
@@ -1836,29 +1892,33 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
   filterScroll: {
-    marginTop: 8,
+    flexShrink: 0,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f0f0',
   },
   filterContainer: {
     flexDirection: 'row',
     gap: 8,
-    paddingRight: 20,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    alignItems: 'center',
   },
   filterChip: {
-    paddingHorizontal: 16,
-    paddingVertical: 8,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
     borderRadius: 20,
     backgroundColor: '#f5f5f5',
     borderWidth: 1,
     borderColor: '#e0e0e0',
   },
   filterChipActive: {
-    backgroundColor: '#4CAF50',
-    borderColor: '#4CAF50',
+    backgroundColor: '#16a34a',
+    borderColor: '#16a34a',
   },
   filterChipText: {
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: '600',
-    color: '#666',
+    color: '#555',
   },
   filterChipTextActive: {
     color: '#fff',
@@ -1945,8 +2005,9 @@ const styles = StyleSheet.create({
     paddingLeft: 8,
   },
   emptyState: {
+    flex: 1,
     alignItems: 'center',
-    paddingVertical: 40,
+    justifyContent: 'center',
   },
   emptyStateText: {
     fontSize: 16,
@@ -2008,37 +2069,281 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     elevation: 8,
   },
-  notificationBanner: {
-    position: 'absolute',
-    left: 16,
-    right: 16,
-    backgroundColor: '#4CAF50',
-    borderRadius: 12,
-    padding: 12,
-    zIndex: 1000,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 4,
-    elevation: 8,
+  // ── Permanent Drivers Section ──────────────────────────────────────────────
+  permSection: {
+    borderTopWidth: 1,
+    borderTopColor: '#f0f0f0',
+    paddingTop: 14,
+    paddingBottom: 8,
   },
-  notificationBannerContent: {
+  permSectionHeader: {
+    paddingHorizontal: 20,
+    marginBottom: 10,
+  },
+  permSectionTitleRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    gap: 6,
+    marginBottom: 2,
+  },
+  permSectionTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#1565C0',
+  },
+  permSectionSub: {
+    fontSize: 12,
+    color: '#888',
+    marginLeft: 24,
+  },
+  permCardsRow: {
+    paddingHorizontal: 16,
+    paddingBottom: 4,
     gap: 12,
   },
-  notificationBannerText: {
+  permCard: {
+    width: 150,
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#E3F2FD',
+    shadowColor: '#1565C0',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 6,
+    elevation: 3,
+  },
+  permPhotoWrap: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    marginBottom: 8,
+    alignSelf: 'center',
+    position: 'relative',
+  },
+  permPhoto: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    borderWidth: 2,
+    borderColor: '#BBDEFB',
+  },
+  permPhotoFallback: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    backgroundColor: '#1565C0',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  permPhotoInitials: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#fff',
+  },
+  permFeaturedBadge: {
+    position: 'absolute',
+    bottom: 0,
+    right: 0,
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: '#FFC107',
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1.5,
+    borderColor: '#fff',
+  },
+  permName: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#1a1a1a',
+    textAlign: 'center',
+    marginBottom: 2,
+  },
+  permVehicle: {
+    fontSize: 11,
+    color: '#666',
+    textAlign: 'center',
+    marginBottom: 6,
+  },
+  permBadgeRow: {
+    flexDirection: 'row',
+    gap: 4,
+    justifyContent: 'center',
+    marginBottom: 5,
+    flexWrap: 'wrap',
+  },
+  permBadgeVerified: {
+    backgroundColor: '#E3F2FD',
+    borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  permBadgeVerifiedText: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: '#1565C0',
+    letterSpacing: 0.5,
+  },
+  permBadgePricing: {
+    backgroundColor: '#E8F5E9',
+    borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  permBadgePricingText: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: '#2E7D32',
+    letterSpacing: 0.5,
+  },
+  permPricingLine: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#2E7D32',
+    textAlign: 'center',
+    marginBottom: 4,
+  },
+  permMeta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+    justifyContent: 'center',
+    marginBottom: 2,
+  },
+  permMetaText: {
+    fontSize: 11,
+    color: '#888',
+    maxWidth: 110,
+  },
+  permActions: {
+    flexDirection: 'row',
+    gap: 6,
+    marginTop: 8,
+  },
+  permCallBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    backgroundColor: '#1565C0',
+    borderRadius: 10,
+    paddingVertical: 7,
+  },
+  permCallBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#fff',
+  },
+  permWaBtn: {
+    width: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#E8F5E9',
+    borderRadius: 10,
+    paddingVertical: 7,
+  },
+  activeTripBanner: {
+    position: 'absolute',
+    left: 12,
+    right: 12,
+    zIndex: 800,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#16A34A',
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    shadowColor: '#16A34A',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.35,
+    shadowRadius: 10,
+    elevation: 8,
+  },
+  activeTripBannerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
     flex: 1,
   },
-  notificationBannerTitle: {
+  activeTripPulse: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: 'rgba(255,255,255,0.25)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  activeTripBannerTitle: {
     fontSize: 14,
     fontWeight: '700',
     color: '#fff',
-    marginBottom: 2,
   },
-  notificationBannerMessage: {
+  activeTripBannerSub: {
     fontSize: 12,
+    color: 'rgba(255,255,255,0.85)',
+    marginTop: 1,
+  },
+  activeTripBannerRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginLeft: 8,
+  },
+  activeTripBannerTrack: {
+    fontSize: 13,
+    fontWeight: '700',
     color: '#fff',
-    opacity: 0.9,
+  },
+  activeTripOtpRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 2,
+  },
+  activeTripOtpLabel: {
+    fontSize: 12,
+    color: 'rgba(255,255,255,0.9)',
+  },
+  activeTripOtpCode: {
+    fontSize: 14,
+    fontWeight: '900',
+    color: '#fff',
+    letterSpacing: 2,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    paddingHorizontal: 6,
+    paddingVertical: 1,
+    borderRadius: 4,
+  },
+  driverCallout: {
+    backgroundColor: '#fff',
+    borderRadius: 8,
+    padding: 8,
+    minWidth: 140,
+    maxWidth: 200,
+    elevation: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 4,
+  },
+  driverCalloutType: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#1a1a1a',
+    marginBottom: 4,
+  },
+  driverCalloutAddressRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 3,
+  },
+  driverCalloutAddress: {
+    fontSize: 11,
+    color: '#555',
+    flex: 1,
+    lineHeight: 15,
   },
 });

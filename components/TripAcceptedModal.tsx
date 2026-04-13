@@ -24,7 +24,8 @@ export default function TripAcceptedModal({ visible, onClose, role }: TripAccept
 
   if (!activeTrip) return null;
 
-  const otp = activeTrip.otp || activeTrip.pickupCode || 'N/A';
+  // otp and pickupCode are the same value (generated together at trip acceptance)
+  const pickupCode = (activeTrip as any).pickupCode || activeTrip.otp || 'N/A';
 
   const handleTrackDriver = () => {
     onClose();
@@ -59,7 +60,7 @@ export default function TripAcceptedModal({ visible, onClose, role }: TripAccept
             <View style={styles.content}>
               <View style={styles.otpContainer}>
                 <Text style={styles.otpLabel}>Your OTP</Text>
-                <Text style={styles.otpValue}>{otp}</Text>
+                <Text style={styles.otpValue}>{pickupCode}</Text>
                 <Text style={styles.otpHint}>Share this code with your driver</Text>
               </View>
 

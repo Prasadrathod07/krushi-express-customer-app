@@ -11,9 +11,11 @@ import {
   Dimensions,
   ScrollView,
   Animated,
+  Platform,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useRouter, useLocalSearchParams } from 'expo-router';
-import { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import * as Haptics from 'expo-haptics';
 import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
@@ -23,6 +25,8 @@ import { SOCKET_URL } from '../lib/env';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { notificationService } from '../services/notificationService';
 import { useTrip } from '../contexts/TripContext';
+import { getRouteInfo, formatDistance, formatDuration, formatArrivalTime } from '../services/directionsService';
+import VehicleMarker from '../components/VehicleMarker';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -76,7 +80,8 @@ export default function TripTracking() {
   const router = useRouter();
   const params = useLocalSearchParams();
   const tripId = params.id as string;
-  const { activeTrip, setActiveTrip, updateTripState } = useTrip();
+  const insets = useSafeAreaInsets();
+  const { activeTrip, setActiveTrip, updateTripState, clearActiveTrip } = useTrip();
 
   const [trip, setTrip] = useState<Trip | null>(null);
   const [loading, setLoading] = useState(true);
@@ -87,15 +92,23 @@ export default function TripTracking() {
   } | null>(null);
   const [eta, setEta] = useState<number | null>(null);
   const [distance, setDistance] = useState<number | null>(null);
+  const [etaText, setEtaText] = useState<string | null>(null);
+  const [distanceText, setDistanceText] = useState<string | null>(null);
+  const [arrivalTimeText, setArrivalTimeText] = useState<string | null>(null);
   const [otp, setOtp] = useState<string | null>(null);
   const [otpVerified, setOtpVerified] = useState(false);
   const [showRatingModal, setShowRatingModal] = useState(false);
   const [hasCheckedRating, setHasCheckedRating] = useState(false);
+  const [showCompletedOverlay, setShowCompletedOverlay] = useState(false);
   const [routeCoordinates, setRouteCoordinates] = useState<Array<{ latitude: number; longitude: number }>>([]);
+  const [dropRouteCoordinates, setDropRouteCoordinates] = useState<Array<{ latitude: number; longitude: number }>>([]);
   const [driverHeading, setDriverHeading] = useState<number>(0); // Direction in degrees (0-360)
   const previousDriverLocation = useRef<{ latitude: number; longitude: number } | null>(null);
+  const routeFetchTimeout = useRef<NodeJS.Timeout | null>(null);
+  const locationPollInterval = useRef<NodeJS.Timeout | null>(null);
 
   const mapRef = useRef<MapView>(null);
+  const driverCancelHandledRef = useRef(false);
   
   // Calculate bearing between two coordinates (in degrees)
   const calculateBearing = (from: { latitude: number; longitude: number }, to: { latitude: number; longitude: number }): number => {
@@ -129,9 +142,18 @@ export default function TripTracking() {
 
     return () => {
       if (socket) {
+        // Leave the trip room before disconnecting so the server cleans up subscription
+        socket.emit('leave-trip-room', { tripId });
+        socket.removeAllListeners();
         socket.disconnect();
       }
-      notificationService.removeAllListeners();
+      if (locationPollInterval.current) {
+        clearInterval(locationPollInterval.current);
+        locationPollInterval.current = null;
+      }
+      if (routeFetchTimeout.current) clearTimeout(routeFetchTimeout.current);
+      // Do NOT call notificationService.removeAllListeners() here — that destroys
+      // the global listener set up by _layout.tsx, crashing the next notification.
     };
   }, [tripId]);
 
@@ -139,7 +161,7 @@ export default function TripTracking() {
     if (trip?.driverCurrentLocation) {
       const [lng, lat] = trip.driverCurrentLocation.coordinates;
       setDriverLocation({ latitude: lat, longitude: lng });
-      
+
       if (trip.currentTripState === 'ENROUTE_TO_PICKUP' || trip.currentTripState === 'ACCEPTED') {
         setEta(trip.estimatedTimeToPickup || null);
       } else if (trip.currentTripState === 'ENROUTE_TO_DELIVERY' || trip.currentTripState === 'PICKED_UP') {
@@ -148,13 +170,111 @@ export default function TripTracking() {
     }
   }, [trip]);
 
+  // Fetch road route from driver → pickup whenever driver location changes (debounced)
   useEffect(() => {
-    if (driverLocation && mapRef.current) {
-      mapRef.current.animateToRegion({
-        ...driverLocation,
-        latitudeDelta: 0.01,
-        longitudeDelta: 0.01,
-      }, 1000);
+    if (!driverLocation || !trip?.pickupLocation) return;
+    const state = trip.currentTripState;
+    if (!['ACCEPTED', 'ENROUTE_TO_PICKUP'].includes(state)) return;
+    if (routeFetchTimeout.current) clearTimeout(routeFetchTimeout.current);
+    routeFetchTimeout.current = setTimeout(async () => {
+      try {
+        const pickup = {
+          latitude: trip.pickupLocation.coordinates[1],
+          longitude: trip.pickupLocation.coordinates[0],
+        };
+        const info = await getRouteInfo(driverLocation, pickup);
+        setRouteCoordinates(info.coordinates);
+        setDistance(info.distance);
+        setDistanceText(info.distanceText);
+        setEta(info.duration);
+        setEtaText(info.durationText);
+        setArrivalTimeText(info.arrivalTime);
+      } catch {}
+    }, 1500);
+    return () => { if (routeFetchTimeout.current) clearTimeout(routeFetchTimeout.current); };
+  }, [driverLocation]);
+
+  // Fetch road route pickup → drop once (for delivery phase)
+  useEffect(() => {
+    if (!trip?.pickupLocation || !trip?.dropLocation) return;
+    const pickup = { latitude: trip.pickupLocation.coordinates[1], longitude: trip.pickupLocation.coordinates[0] };
+    const drop   = { latitude: trip.dropLocation.coordinates[1],   longitude: trip.dropLocation.coordinates[0] };
+    getRouteInfo(pickup, drop).then(info => setDropRouteCoordinates(info.coordinates)).catch(() => {});
+  }, [trip?._id]);
+
+  // Polling fallback: when driver location is missing, poll trip every 5s until we get it
+  useEffect(() => {
+    const ACTIVE_STATES = ['ACCEPTED','ENROUTE_TO_PICKUP','ARRIVED_AT_PICKUP','PICKED_UP','ENROUTE_TO_DELIVERY','ARRIVED_AT_DELIVERY','DELIVERING'];
+    const state = trip?.currentTripState;
+
+    if (!state || !ACTIVE_STATES.includes(state)) {
+      if (locationPollInterval.current) {
+        clearInterval(locationPollInterval.current);
+        locationPollInterval.current = null;
+      }
+      return;
+    }
+
+    // Already have location — clear poll
+    if (driverLocation) {
+      if (locationPollInterval.current) {
+        clearInterval(locationPollInterval.current);
+        locationPollInterval.current = null;
+      }
+      return;
+    }
+
+    // Start polling
+    if (!locationPollInterval.current) {
+      locationPollInterval.current = setInterval(async () => {
+        try {
+          const res = await tripsAPI.getTrip(tripId) as any;
+          if (res.ok && res.data?.driverCurrentLocation) {
+            const [lng, lat] = res.data.driverCurrentLocation.coordinates;
+            const newLoc = { latitude: lat, longitude: lng };
+            setDriverLocation(newLoc);
+            setTrip(res.data);
+            // Once we have location, stop polling
+            if (locationPollInterval.current) {
+              clearInterval(locationPollInterval.current);
+              locationPollInterval.current = null;
+            }
+          }
+        } catch {}
+      }, 5000);
+    }
+
+    return () => {
+      if (locationPollInterval.current) {
+        clearInterval(locationPollInterval.current);
+        locationPollInterval.current = null;
+      }
+    };
+  }, [driverLocation, trip?.currentTripState, tripId]);
+
+  useEffect(() => {
+    if (!driverLocation || !mapRef.current) return;
+    const state = trip?.currentTripState;
+    if (state === 'ACCEPTED' || state === 'ENROUTE_TO_PICKUP') {
+      // Fit map to show both driver and pickup
+      if (trip?.pickupLocation) {
+        const pickup = { latitude: trip.pickupLocation.coordinates[1], longitude: trip.pickupLocation.coordinates[0] };
+        mapRef.current.fitToCoordinates([driverLocation, pickup], {
+          edgePadding: { top: 60, right: 40, bottom: 80, left: 40 },
+          animated: true,
+        });
+      }
+    } else if (state === 'PICKED_UP' || state === 'ENROUTE_TO_DELIVERY') {
+      // Fit map to show driver and drop
+      if (trip?.dropLocation) {
+        const drop = { latitude: trip.dropLocation.coordinates[1], longitude: trip.dropLocation.coordinates[0] };
+        mapRef.current.fitToCoordinates([driverLocation, drop], {
+          edgePadding: { top: 60, right: 40, bottom: 80, left: 40 },
+          animated: true,
+        });
+      }
+    } else {
+      mapRef.current.animateToRegion({ ...driverLocation, latitudeDelta: 0.01, longitudeDelta: 0.01 }, 1000);
     }
   }, [driverLocation]);
 
@@ -198,23 +318,18 @@ export default function TripTracking() {
           
           setDriverLocation(newLocation);
           
-          // Update ETA and distance
+          // Update ETA and distance from socket (backend sends raw numbers)
           if (data.eta !== undefined && data.eta !== null) {
             setEta(data.eta);
+            setEtaText(formatDuration(data.eta));
+            setArrivalTimeText(formatArrivalTime(data.eta));
           }
           if (data.distance !== undefined && data.distance !== null) {
             setDistance(data.distance);
+            setDistanceText(formatDistance(data.distance));
           }
           
-          // Update route if we have pickup location
-          if (trip?.pickupLocation) {
-            const pickupCoords = trip.pickupLocation.coordinates;
-            const pickupLatLng = { latitude: pickupCoords[1], longitude: pickupCoords[0] };
-            setRouteCoordinates([
-              pickupLatLng,
-              newLocation
-            ]);
-          }
+          // Road route is fetched via useEffect on driverLocation change
           
           // Update map to show driver location
           if (mapRef.current) {
@@ -276,10 +391,30 @@ export default function TripTracking() {
       newSocket.on('trip-state-updated', (data: any) => {
         if (data.tripId === tripId) {
           const previousState = trip?.currentTripState;
-          
+
+          // Driver cancelled — show popup and offer to find another driver
+          if (data.state === 'DRIVER_CANCELLED') {
+            if (driverCancelHandledRef.current) return;
+            driverCancelHandledRef.current = true;
+            clearActiveTrip();
+            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+            const pickupParam = trip?.pickupLocation ? JSON.stringify(trip.pickupLocation) : undefined;
+            const dropParam   = trip?.dropLocation   ? JSON.stringify(trip.dropLocation)   : undefined;
+            Alert.alert(
+              'Driver Not Available',
+              'The driver is not ready for this trip. Please book another driver or try after some time.',
+              [
+                { text: 'Find Another Driver', onPress: () => router.replace({ pathname: '/searching-drivers', params: { pickupLocation: pickupParam, dropLocation: dropParam } }) },
+                { text: 'Go Home', style: 'cancel', onPress: () => router.replace('/(tabs)/home') },
+              ],
+              { cancelable: false },
+            );
+            return;
+          }
+
           // CRITICAL FIX: Update context
           updateTripState(tripId, data.state, data.trip);
-          
+
           loadTrip().then(() => {
             // Check if trip just completed and show rating prompt
             if (previousState !== 'COMPLETED' && data.state === 'COMPLETED') {
@@ -289,6 +424,27 @@ export default function TripTracking() {
               }, 2000);
             }
           });
+        }
+      });
+
+      // Direct trip-cancelled event (emitted to customer room by backend)
+      newSocket.on('trip-cancelled', (data: any) => {
+        if (data.tripId?.toString() === tripId && data.cancelledBy === 'driver') {
+          if (driverCancelHandledRef.current) return;
+          driverCancelHandledRef.current = true;
+          clearActiveTrip();
+          Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+          const pickupParam = trip?.pickupLocation ? JSON.stringify(trip.pickupLocation) : undefined;
+          const dropParam   = trip?.dropLocation   ? JSON.stringify(trip.dropLocation)   : undefined;
+          Alert.alert(
+            'Driver Not Available',
+            'The driver is not ready for this trip. Please book another driver or try after some time.',
+            [
+              { text: 'Find Another Driver', onPress: () => router.replace({ pathname: '/searching-drivers', params: { pickupLocation: pickupParam, dropLocation: dropParam } }) },
+              { text: 'Go Home', style: 'cancel', onPress: () => router.replace('/(tabs)/home') },
+            ],
+            { cancelable: false },
+          );
         }
       });
 
@@ -309,6 +465,46 @@ export default function TripTracking() {
             'New Pickup Code',
             data.message || 'A new pickup code has been generated. Please check with the driver.',
             [{ text: 'OK' }]
+          );
+        }
+      });
+
+      // Stale trip check — ask customer if trip is still happening
+      newSocket.on('stale-trip-check', (data: any) => {
+        if (data.tripId === tripId) {
+          Alert.alert(
+            'Is This Trip Still Active?',
+            'Your trip has been accepted for a while with no pickup. Is it still happening?',
+            [
+              {
+                text: 'No, Cancel It',
+                style: 'destructive',
+                onPress: async () => {
+                  try {
+                    const token = await AsyncStorage.getItem('userToken');
+                    await fetch(`${require('../lib/env').API_URL}/api/trips/${tripId}/stale-response`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                      body: JSON.stringify({ response: 'NO' }),
+                    });
+                  } catch {}
+                },
+              },
+              {
+                text: 'Yes, Still Active',
+                onPress: async () => {
+                  try {
+                    const token = await AsyncStorage.getItem('userToken');
+                    await fetch(`${require('../lib/env').API_URL}/api/trips/${tripId}/stale-response`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                      body: JSON.stringify({ response: 'YES' }),
+                    });
+                  } catch {}
+                },
+              },
+            ],
+            { cancelable: false },
           );
         }
       });
@@ -379,9 +575,10 @@ export default function TripTracking() {
           setOtpVerified(true);
         }
         
-        // Check if trip is completed and show rating prompt (only once)
+        // Check if trip is completed — show overlay (only once)
         if (updatedTrip.currentTripState === 'COMPLETED' && !hasCheckedRating) {
           setHasCheckedRating(true);
+          setShowCompletedOverlay(true);
           // Check if already rated
           try {
             const ratingResponse = await tripsAPI.getTripRating(tripId);
@@ -433,28 +630,7 @@ export default function TripTracking() {
   };
 
   const showRatingPrompt = () => {
-    Alert.alert(
-      'Trip Completed!',
-      'How was your experience? Please rate your driver.',
-      [
-        {
-          text: 'Skip',
-          style: 'cancel',
-          onPress: () => {
-            // Store in AsyncStorage that user skipped for this trip
-            AsyncStorage.setItem(`rating_skipped_${tripId}`, 'true');
-          },
-        },
-        {
-          text: 'Rate Now',
-          onPress: () => {
-            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-            router.push(`/rate-trip?tripId=${tripId}`);
-          },
-        },
-      ],
-      { cancelable: true }
-    );
+    setShowCompletedOverlay(true);
   };
 
   const handleCallDriver = () => {
@@ -500,632 +676,463 @@ export default function TripTracking() {
 
   if (loading) {
     return (
-      <SafeAreaView style={styles.safeArea}>
-        <View style={styles.loadingContainer}>
-          <ActivityIndicator size="large" color="#4CAF50" />
-          <Text style={styles.loadingText}>Loading trip details...</Text>
-        </View>
-      </SafeAreaView>
+      <View style={s.loadWrap}>
+        <ActivityIndicator size="large" color="#16A34A" />
+        <Text style={s.loadTxt}>Loading trip…</Text>
+      </View>
     );
   }
 
   if (!trip) {
     return (
-      <SafeAreaView style={styles.safeArea}>
-        <View style={styles.loadingContainer}>
-          <Icon name="error-outline" size={48} color="#f44336" />
-          <Text style={styles.loadingText}>Trip not found</Text>
-          <TouchableOpacity
-            style={styles.backButton}
-            onPress={() => router.back()}
-          >
-            <Text style={styles.backButtonText}>Go Back</Text>
-          </TouchableOpacity>
-        </View>
-      </SafeAreaView>
+      <View style={s.loadWrap}>
+        <Icon name="error-outline" size={48} color="#EF4444" />
+        <Text style={s.loadTxt}>Trip not found</Text>
+        <TouchableOpacity style={s.goBackBtn} onPress={() => router.back()}>
+          <Text style={s.goBackTxt}>Go Back</Text>
+        </TouchableOpacity>
+      </View>
     );
   }
 
-  const status = getTripStatusText(trip.currentTripState);
-  const pickupCoords = trip.pickupLocation.coordinates;
-  const dropCoords = trip.dropLocation.coordinates;
-  const pickupLatLng = { latitude: pickupCoords[1], longitude: pickupCoords[0] };
-  const dropLatLng = { latitude: dropCoords[1], longitude: dropCoords[0] };
+  // Guard: trip is still searching — redirect to the correct screen instead of crashing
+  if (['REQUESTED', 'PENDING', 'NEW'].includes(trip.currentTripState)) {
+    router.replace({ pathname: '/searching-drivers', params: { tripId: trip._id } });
+    return null;
+  }
+
+  // Guard: trip is in negotiation — redirect to negotiation chat
+  if (trip.currentTripState === 'NEGOTIATING') {
+    router.replace({ pathname: '/trip-negotiation', params: { tripId: trip._id } });
+    return null;
+  }
+
+  // Guard: location data missing (race condition during state transition)
+  if (!trip.pickupLocation?.coordinates || !trip.dropLocation?.coordinates) {
+    return (
+      <View style={s.loadWrap}>
+        <ActivityIndicator size="large" color="#16A34A" />
+        <Text style={s.loadTxt}>Loading trip details…</Text>
+      </View>
+    );
+  }
+
+  const status     = getTripStatusText(trip.currentTripState);
+  const pickupLL   = { latitude: trip.pickupLocation.coordinates[1], longitude: trip.pickupLocation.coordinates[0] };
+  const dropLL     = { latitude: trip.dropLocation.coordinates[1],   longitude: trip.dropLocation.coordinates[0] };
+
+  const driverName = trip.driver?.name
+    || (typeof trip.driverId === 'object' ? (trip.driverId as any)?.name : null)
+    || 'Your Driver';
+  const driverVehicle = [
+    trip.driver?.vehicleDetails?.type || trip.driver?.vehicleType
+      || (typeof trip.driverId === 'object' ? (trip.driverId as any)?.vehicleType : null),
+    trip.driver?.vehicleDetails?.number || trip.driver?.vehicleNumber
+      || (typeof trip.driverId === 'object' ? (trip.driverId as any)?.vehicleNumber : null),
+  ].filter(Boolean).join(' • ') || 'Tempo';
+
+  const otpCode = otp || (trip as any).otp || (trip as any).pickupCode;
+  const showOtp = ['ACCEPTED','ENROUTE_TO_PICKUP','ARRIVED_AT_PICKUP'].includes(trip.currentTripState) && !!otpCode && !otpVerified;
+  const hasDriver = !!(trip.driver || (trip.driverId && typeof trip.driverId === 'object'));
+  const isActive  = ['ACCEPTED','ENROUTE_TO_PICKUP','ARRIVED_AT_PICKUP','PICKED_UP','ENROUTE_TO_DELIVERY','ARRIVED_AT_DELIVERY','DELIVERING'].includes(trip.currentTripState);
 
   return (
-    <SafeAreaView style={styles.safeArea}>
-      <StatusBar barStyle="light-content" backgroundColor="#1a1a1a" />
-      
-      {/* Header - Fixed at top */}
-      <View style={styles.header}>
-        <TouchableOpacity
-          onPress={() => {
-            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-            // Navigate to home screen instead of just going back
-            router.replace('/(tabs)/home');
-          }}
-          style={styles.headerButton}
-        >
-          <Icon name="arrow-back" size={24} color="#fff" />
+    <View style={s.root}>
+      <StatusBar barStyle="dark-content" translucent backgroundColor="transparent" />
+
+      {/* ── Full-screen map ── */}
+      <MapView
+        ref={mapRef}
+        provider={PROVIDER_GOOGLE}
+        style={s.map}
+        initialRegion={{ ...pickupLL, latitudeDelta: 0.06, longitudeDelta: 0.06 }}
+        showsUserLocation={false}
+        showsMyLocationButton={false}
+        showsCompass={false}
+        mapType="standard"
+        scrollEnabled
+        zoomEnabled
+      >
+        {/* Pickup pin */}
+        <Marker coordinate={pickupLL} anchor={{ x: 0.5, y: 1 }}>
+          <View style={s.pinWrap}>
+            <View style={[s.pin, s.pinGreen]}>
+              <Icon name="location-on" size={18} color="#fff" />
+            </View>
+            <View style={[s.pinTip, { borderTopColor: '#16A34A' }]} />
+          </View>
+        </Marker>
+
+        {/* Drop pin */}
+        <Marker coordinate={dropLL} anchor={{ x: 0.5, y: 1 }}>
+          <View style={s.pinWrap}>
+            <View style={[s.pin, s.pinOrange]}>
+              <Icon name="flag" size={18} color="#fff" />
+            </View>
+            <View style={[s.pinTip, { borderTopColor: '#EA580C' }]} />
+          </View>
+        </Marker>
+
+        {/* Driver marker — vehicle-specific SVG with direction */}
+        {driverLocation && (
+          <Marker coordinate={driverLocation} anchor={{ x: 0.5, y: 0.5 }} flat tracksViewChanges={false}>
+            <VehicleMarker
+              vehicleType={driverVehicle}
+              heading={driverHeading}
+              size={52}
+            />
+          </Marker>
+        )}
+
+        {/* Route: driver → pickup — white border + blue fill (Google Maps style) */}
+        {driverLocation && ['ACCEPTED','ENROUTE_TO_PICKUP'].includes(trip.currentTripState) && <>
+          <Polyline
+            coordinates={routeCoordinates.length > 1 ? routeCoordinates : [driverLocation, pickupLL]}
+            strokeColor="#fff"
+            strokeWidth={9}
+            lineCap="round"
+            lineJoin="round"
+          />
+          <Polyline
+            coordinates={routeCoordinates.length > 1 ? routeCoordinates : [driverLocation, pickupLL]}
+            strokeColor="#1A73E8"
+            strokeWidth={6}
+            lineCap="round"
+            lineJoin="round"
+          />
+        </>}
+
+        {/* Route: pickup → drop — white border + green fill */}
+        {['PICKED_UP','ENROUTE_TO_DELIVERY','ARRIVED_AT_DELIVERY','DELIVERING'].includes(trip.currentTripState) && <>
+          <Polyline
+            coordinates={dropRouteCoordinates.length > 1 ? dropRouteCoordinates : [pickupLL, dropLL]}
+            strokeColor="#fff"
+            strokeWidth={9}
+            lineCap="round"
+            lineJoin="round"
+          />
+          <Polyline
+            coordinates={dropRouteCoordinates.length > 1 ? dropRouteCoordinates : [pickupLL, dropLL]}
+            strokeColor="#16A34A"
+            strokeWidth={6}
+            lineCap="round"
+            lineJoin="round"
+          />
+        </>}
+      </MapView>
+
+      {/* ── Floating top bar ── */}
+      <View style={[s.topBar, { paddingTop: insets.top + 8 }]}>
+        <TouchableOpacity style={s.topBtn} onPress={() => { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); router.dismissAll(); router.replace('/(tabs)/home'); }}>
+          <Icon name="arrow-back" size={22} color="#111" />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Trip Tracking</Text>
-        <View style={styles.headerRight}>
-          {/* Negotiation Chat Button - Show if trip is in negotiable state */}
-          {(trip.currentTripState === 'REQUESTED' || trip.currentTripState === 'NEGOTIATING') && (
-            <TouchableOpacity
-              style={styles.negotiateChatButton}
-              onPress={() => {
-                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-                router.push({
-                  pathname: '/trip-negotiation',
-                  params: { tripId: tripId },
-                });
-              }}
-              activeOpacity={0.7}
-            >
-              <Icon name="chat" size={18} color="#FF9800" />
-              <Text style={styles.negotiateChatButtonText}>Chat</Text>
-            </TouchableOpacity>
-          )}
+
+        {/* Status pill */}
+        <View style={[s.statusPill, { backgroundColor: status.color + '22', borderColor: status.color }]}>
+          <Icon name={status.icon} size={14} color={status.color} />
+          <Text style={[s.statusPillTxt, { color: status.color }]}>{status.text}</Text>
         </View>
+
+        {/* Negotiate chat (if negotiating) */}
+        {(trip.currentTripState === 'REQUESTED' || trip.currentTripState === 'NEGOTIATING') && (
+          <TouchableOpacity style={s.topBtn} onPress={() => router.push({ pathname: '/trip-negotiation', params: { tripId } })}>
+            <Icon name="chat" size={22} color="#F97316" />
+          </TouchableOpacity>
+        )}
+        {!(trip.currentTripState === 'REQUESTED' || trip.currentTripState === 'NEGOTIATING') && <View style={s.topBtn} />}
       </View>
 
-      {/* Scrollable Content */}
-      <ScrollView 
-        style={styles.scrollContainer}
-        contentContainerStyle={styles.scrollContent}
-        showsVerticalScrollIndicator={true}
-      >
-        {/* Status Card */}
-        <View style={styles.statusCard}>
-          <View style={[styles.statusIcon, { backgroundColor: `${status.color}20` }]}>
-            <Icon name={status.icon} size={32} color={status.color} />
-          </View>
-          <View style={styles.statusInfo}>
-            <Text style={styles.statusText}>{status.text}</Text>
-            {eta !== null && (
-              <Text style={styles.etaText}>
-                ETA: {eta} {eta === 1 ? 'minute' : 'minutes'}
+      {/* ── ETA card floating on map (Google Maps style) ── */}
+      {driverLocation && (etaText || distanceText) && (
+        <View style={[s.etaCard, { top: insets.top + 64 }]}>
+          {/* Main: big time */}
+          <Text style={s.etaBigTime}>{etaText ?? '—'}</Text>
+          {/* Row: distance + arrival */}
+          <View style={s.etaSubRow}>
+            {distanceText && (
+              <Text style={s.etaSubTxt}>
+                <Icon name="straighten" size={12} color="#6B7280" /> {distanceText}
               </Text>
             )}
-            {distance !== null && (
-              <Text style={styles.etaText}>
-                Distance: {distance.toFixed(1)} km
-              </Text>
+            {distanceText && arrivalTimeText && <Text style={s.etaDot}>·</Text>}
+            {arrivalTimeText && (
+              <Text style={s.etaSubTxt}>{arrivalTimeText}</Text>
             )}
           </View>
         </View>
+      )}
 
-        {/* OTP Card - CRITICAL FIX: Show based on trip.currentTripState (source of truth) */}
-        {trip && trip.currentTripState && ['ACCEPTED', 'ENROUTE_TO_PICKUP', 'ARRIVED_AT_PICKUP'].includes(trip.currentTripState) && (otp || trip.otp) && (
-          <View style={styles.otpCard}>
-            <View style={styles.otpCardHeader}>
-              <Icon name={otpVerified ? "verified" : "lock"} size={24} color={otpVerified ? "#4CAF50" : "#FF9800"} />
-              <View style={styles.otpCardInfo}>
-                <Text style={styles.otpCardTitle}>
-                  {otpVerified ? "OTP Verified" : "Share OTP with Driver"}
-                </Text>
-                <Text style={styles.otpCardSubtitle}>
-                  {otpVerified 
-                    ? "Driver has verified the OTP. Your ride will start shortly."
-                    : "Show this OTP to your driver when they arrive at pickup location."
-                  }
-                </Text>
-              </View>
+      {/* ── Bottom sheet ── */}
+      <View style={[s.sheet, { paddingBottom: insets.bottom + 12 }]}>
+
+        {/* Driver row */}
+        {(hasDriver || isActive) && (
+          <View style={s.driverRow}>
+            <View style={s.driverAvatarWrap}>
+              <Text style={s.driverAvatarLetter}>{driverName.charAt(0).toUpperCase()}</Text>
+              <View style={s.onlineDot} />
             </View>
-            <View style={styles.otpDisplay}>
-              <Text style={styles.otpText}>{otp || trip.otp}</Text>
+            <View style={s.driverMeta}>
+              <Text style={s.driverNameTxt}>{driverName}</Text>
+              <Text style={s.driverVehicleTxt}>{driverVehicle}</Text>
             </View>
-            {!otpVerified && (
-              <Text style={styles.otpWarning}>
-                ⚠️ Keep this OTP safe. Do not share it with anyone except your driver.
-              </Text>
-            )}
-          </View>
-        )}
-
-        {/* Map */}
-        <View style={styles.mapContainer}>
-          <MapView
-            ref={mapRef}
-            provider={PROVIDER_GOOGLE}
-            style={styles.map}
-            initialRegion={{
-              latitude: pickupLatLng.latitude,
-              longitude: pickupLatLng.longitude,
-              latitudeDelta: 0.05,
-              longitudeDelta: 0.05,
-            }}
-            showsUserLocation={true}
-            showsMyLocationButton={false}
-            mapType="standard"
-            scrollEnabled={false}
-            zoomEnabled={false}
-          >
-            {/* Pickup Marker */}
-            <Marker
-              coordinate={pickupLatLng}
-              title="Pickup Location"
-              description={trip.pickupLocation.address}
-              pinColor="#4CAF50"
-            />
-
-            {/* Drop Marker */}
-            <Marker
-              coordinate={dropLatLng}
-              title="Drop Location"
-              description={trip.dropLocation.address}
-              pinColor="#FF9800"
-            />
-
-            {/* Driver Location Marker with Directional Arrow */}
-            {driverLocation && (
-              <Marker
-                coordinate={driverLocation}
-                title="Driver Location"
-                description="Driver is here"
-                anchor={{ x: 0.5, y: 0.5 }}
-              >
-                <Animated.View 
-                  style={[
-                    styles.driverMarker,
-                    { transform: [{ rotate: `${driverHeading}deg` }] }
-                  ]}
-                >
-                  <Icon name="arrow-upward" size={32} color="#2196F3" />
-                </Animated.View>
-              </Marker>
-            )}
-
-            {/* Route Line from Driver to Pickup (when driver is enroute) */}
-            {driverLocation && (trip.currentTripState === 'ENROUTE_TO_PICKUP' || trip.currentTripState === 'ACCEPTED') && (
-              <Polyline
-                coordinates={routeCoordinates.length > 0 ? routeCoordinates : [
-                  pickupLatLng,
-                  { latitude: driverLocation.latitude, longitude: driverLocation.longitude }
-                ]}
-                strokeColor="#2196F3"
-                strokeWidth={4}
-                lineDashPattern={[5, 5]}
-              />
-            )}
-            
-            {/* Route Line from Pickup to Drop (when trip started) */}
-            {(trip.currentTripState === 'PICKED_UP' || trip.currentTripState === 'ENROUTE_TO_DELIVERY') && (
-              <Polyline
-                coordinates={[pickupLatLng, dropLatLng]}
-                strokeColor="#4CAF50"
-                strokeWidth={4}
-              />
-            )}
-
-            {/* Legacy Route Line */}
-            {driverLocation && (
-              <Polyline
-                coordinates={[driverLocation, dropLatLng]}
-                strokeColor="#2196F3"
-                strokeWidth={3}
-              />
-            )}
-          </MapView>
-          
-          {/* Distance & ETA Overlay (like Ola/Uber) */}
-          {driverLocation && (eta !== null || distance !== null) && (
-            <View style={styles.distanceETAOverlay}>
-              {distance !== null && (
-                <View style={styles.distanceETARow}>
-                  <Icon name="straighten" size={16} color="#666" />
-                  <Text style={styles.distanceETAText}>{distance.toFixed(1)} km</Text>
-                </View>
-              )}
-              {eta !== null && (
-                <View style={styles.distanceETARow}>
-                  <Icon name="access-time" size={16} color="#666" />
-                  <Text style={styles.distanceETAText}>{eta} min</Text>
-                </View>
-              )}
-            </View>
-          )}
-        </View>
-
-        {/* Driver Info - Show when driver is assigned (ACCEPTED state or later) */}
-        {(trip.driver || (trip.driverId && (trip.currentTripState === 'ACCEPTED' || ['ENROUTE_TO_PICKUP', 'ARRIVED_AT_PICKUP', 'PICKED_UP', 'ENROUTE_TO_DELIVERY', 'ARRIVED_AT_DELIVERY', 'DELIVERING', 'COMPLETED'].includes(trip.currentTripState)))) && (
-          <View style={styles.driverCard}>
-            <View style={styles.driverInfo}>
-              <View style={styles.driverAvatar}>
-                <Text style={styles.driverAvatarText}>
-                  {((trip.driver?.name || (typeof trip.driverId === 'object' ? trip.driverId?.name : null) || 'D')).charAt(0).toUpperCase()}
-                </Text>
-              </View>
-              <View style={styles.driverDetails}>
-                <Text style={styles.driverName}>
-                  {trip.driver?.name || (typeof trip.driverId === 'object' ? trip.driverId?.name : null) || 'Driver'}
-                </Text>
-                <Text style={styles.vehicleInfo}>
-                  {trip.driver?.vehicleDetails?.type || trip.driver?.vehicleType || (typeof trip.driverId === 'object' ? trip.driverId?.vehicleType : null) || 'Tempo'} • {trip.driver?.vehicleDetails?.number || trip.driver?.vehicleNumber || (typeof trip.driverId === 'object' ? trip.driverId?.vehicleNumber : null) || 'N/A'}
-                </Text>
-              </View>
-            </View>
-            <View style={styles.driverActions}>
-              <TouchableOpacity
-                style={[styles.actionButton, styles.callButton]}
-                onPress={handleCallDriver}
-              >
-                <Icon name="phone" size={20} color="#fff" />
+            <View style={s.driverBtns}>
+              <TouchableOpacity style={[s.iconBtn, s.callBtn]} onPress={handleCallDriver}>
+                <Icon name="phone" size={18} color="#fff" />
               </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.actionButton, styles.chatButton]}
-                onPress={handleChatDriver}
-              >
-                <Icon name="chat" size={20} color="#fff" />
+              <TouchableOpacity style={[s.iconBtn, s.chatBtn]} onPress={handleChatDriver}>
+                <Icon name="chat" size={18} color="#fff" />
               </TouchableOpacity>
             </View>
           </View>
         )}
 
-        {/* Trip Info */}
-        <View style={styles.tripInfoCard}>
-          <View style={styles.tripInfoRow}>
-            <Icon name="location-on" size={20} color="#4CAF50" />
-            <View style={styles.tripInfoText}>
-              <Text style={styles.tripInfoLabel}>Pickup</Text>
-              <Text style={styles.tripInfoValue} numberOfLines={2}>
-                {trip.pickupLocation.address || 'Pickup Location'}
-              </Text>
-            </View>
-          </View>
+        {/* Divider */}
+        {(hasDriver || isActive) && <View style={s.divider} />}
 
-          <View style={styles.tripInfoRow}>
-            <Icon name="place" size={20} color="#FF9800" />
-            <View style={styles.tripInfoText}>
-              <Text style={styles.tripInfoLabel}>Drop</Text>
-              <Text style={styles.tripInfoValue} numberOfLines={2}>
-                {trip.dropLocation.address || 'Drop Location'}
-              </Text>
-            </View>
+        {/* Route summary */}
+        <View style={s.routeRow}>
+          <View style={s.routeDots}>
+            <View style={[s.dot, s.dotG]} />
+            <View style={s.routeVLine} />
+            <View style={[s.dot, s.dotO]} />
           </View>
-
-          <View style={styles.tripInfoRow}>
-            <Icon name="category" size={20} color="#666" />
-            <View style={styles.tripInfoText}>
-              <Text style={styles.tripInfoLabel}>Goods</Text>
-              <Text style={styles.tripInfoValue}>
-                {trip.parcelDetails.category} • {trip.parcelDetails.weight}
-              </Text>
-            </View>
-          </View>
-
-          <View style={styles.tripInfoRow}>
-            <Icon name="currency-rupee" size={20} color="#666" />
-            <View style={styles.tripInfoText}>
-              <Text style={styles.tripInfoLabel}>Your Budget</Text>
-              <Text style={styles.tripInfoValue}>₹{trip.parcelDetails?.budget?.toFixed(0) || trip.estimatedFare?.toFixed(0) || '0'}</Text>
-            </View>
+          <View style={s.routeAddrs}>
+            <Text style={s.routeAddrTxt} numberOfLines={1}>{trip.pickupLocation.address || 'Pickup'}</Text>
+            <View style={{ height: 12 }} />
+            <Text style={s.routeAddrTxt} numberOfLines={1}>{trip.dropLocation.address || 'Drop'}</Text>
           </View>
         </View>
-      </ScrollView>
-    </SafeAreaView>
+
+        {/* OTP — small inline strip */}
+        {showOtp && (
+          <View style={s.otpStrip}>
+            <Icon name={otpVerified ? 'verified' : 'lock'} size={16} color={otpVerified ? '#16A34A' : '#F59E0B'} />
+            <Text style={s.otpLabel}>{otpVerified ? 'Code verified ✓' : 'Pickup code:'}</Text>
+            {!otpVerified && <Text style={s.otpCode}>{otpCode}</Text>}
+            {!otpVerified && <Text style={s.otpHint}>Show to driver</Text>}
+          </View>
+        )}
+      </View>
+
+      {/* ── Trip Completed Overlay ── */}
+      {showCompletedOverlay && (
+        <View style={s.completedOverlay}>
+          <View style={s.completedCard}>
+            {/* Big animated checkmark */}
+            <View style={s.completedCircle}>
+              <Icon name="check" size={58} color="#fff" />
+            </View>
+            <Text style={s.completedTitle}>Trip Completed!</Text>
+            <Text style={s.completedSub}>Your delivery has been completed successfully.</Text>
+
+            {/* Summary */}
+            <View style={s.completedSummary}>
+              {hasDriver && (
+                <View style={s.completedSummaryRow}>
+                  <View style={s.completedAvatar}>
+                    <Text style={s.completedAvatarTxt}>{driverName.charAt(0).toUpperCase()}</Text>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.completedDriverName}>{driverName}</Text>
+                    <Text style={s.completedDriverVehicle}>{driverVehicle}</Text>
+                  </View>
+                </View>
+              )}
+              {distanceText && (
+                <View style={s.completedMetaRow}>
+                  <Icon name="straighten" size={15} color="#6B7280" />
+                  <Text style={s.completedMetaTxt}>{distanceText} travelled</Text>
+                </View>
+              )}
+              {trip.estimatedFare > 0 && (
+                <View style={s.completedMetaRow}>
+                  <Icon name="currency-rupee" size={15} color="#16A34A" />
+                  <Text style={[s.completedMetaTxt, { color: '#16A34A', fontWeight: '700' }]}>
+                    {trip.estimatedFare} fare
+                  </Text>
+                </View>
+              )}
+            </View>
+
+            {/* Buttons */}
+            <TouchableOpacity
+              style={s.rateBtn}
+              onPress={() => {
+                Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+                setShowCompletedOverlay(false);
+                router.push(`/rate-trip?tripId=${tripId}`);
+              }}
+            >
+              <Icon name="star" size={20} color="#fff" />
+              <Text style={s.rateBtnTxt}>Rate Driver</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={s.homeBtn}
+              onPress={() => {
+                setShowCompletedOverlay(false);
+                router.replace('/(tabs)/home');
+              }}
+            >
+              <Text style={s.homeBtnTxt}>Go to Home</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+    </View>
   );
 }
 
-const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: '#1a1a1a',
+const s = StyleSheet.create({
+  root: { flex: 1, backgroundColor: '#f0f0f0' },
+
+  // loading
+  loadWrap: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#fff', gap: 12 },
+  loadTxt:  { fontSize: 15, color: '#6B7280' },
+  goBackBtn:{ backgroundColor: '#16A34A', borderRadius: 12, paddingHorizontal: 24, paddingVertical: 10, marginTop: 8 },
+  goBackTxt:{ color: '#fff', fontWeight: '700', fontSize: 14 },
+
+  // map
+  map: { ...StyleSheet.absoluteFillObject },
+
+  // pins
+  pinWrap:  { alignItems: 'center' },
+  pin: { width: 36, height: 36, borderRadius: 18, justifyContent: 'center', alignItems: 'center', shadowColor: '#000', shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.3, shadowRadius: 4, elevation: 5 },
+  pinGreen: { backgroundColor: '#16A34A' },
+  pinOrange:{ backgroundColor: '#EA580C' },
+  pinTip:   { width: 0, height: 0, borderLeftWidth: 6, borderRightWidth: 6, borderTopWidth: 8, borderLeftColor: 'transparent', borderRightColor: 'transparent' },
+
+  // top bar
+  topBar: {
+    position: 'absolute', top: 0, left: 0, right: 0,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 12, paddingBottom: 8,
   },
-  loadingContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
+  topBtn: {
+    width: 40, height: 40, borderRadius: 20,
     backgroundColor: '#fff',
+    justifyContent: 'center', alignItems: 'center',
+    shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.15, shadowRadius: 4, elevation: 4,
   },
-  loadingText: {
-    fontSize: 16,
-    color: '#666',
-    marginTop: 16,
-  },
-  backButton: {
-    marginTop: 20,
-    paddingHorizontal: 24,
-    paddingVertical: 12,
-    backgroundColor: '#4CAF50',
-    borderRadius: 12,
-  },
-  backButtonText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#fff',
-  },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    padding: 16,
-    backgroundColor: '#1a1a1a',
-  },
-  headerButton: {
-    width: 40,
-    height: 40,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  headerRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    minWidth: 40,
-  },
-  headerTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#fff',
-  },
-  negotiateChatButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    backgroundColor: '#FFF3E0',
-    paddingVertical: Math.max(8, SCREEN_WIDTH * 0.02),
-    paddingHorizontal: Math.max(14, SCREEN_WIDTH * 0.035),
-    borderRadius: 20,
-    borderWidth: 1.5,
-    borderColor: '#FFB74D',
-    minWidth: SCREEN_WIDTH * 0.2,
-  },
-  negotiateChatButtonText: {
-    fontSize: Math.max(12, SCREEN_WIDTH * 0.035),
-    fontWeight: '700',
-    color: '#FF9800',
-  },
-  statusCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
+  statusPill: {
+    flexDirection: 'row', alignItems: 'center', gap: 5,
+    paddingHorizontal: 14, paddingVertical: 7,
+    borderRadius: 20, borderWidth: 1,
     backgroundColor: '#fff',
-    padding: 20,
-    margin: 16,
-    marginTop: 16,
-    borderRadius: 16,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 4,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.1, shadowRadius: 4, elevation: 3,
   },
-  statusIcon: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 16,
+  statusPillTxt: { fontSize: 13, fontWeight: '700' },
+
+  // ETA card (Google Maps style — floating on map)
+  etaCard: {
+    position: 'absolute', right: 12,
+    backgroundColor: '#fff',
+    borderRadius: 14, paddingHorizontal: 14, paddingVertical: 10,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.18, shadowRadius: 8, elevation: 8,
+    minWidth: 120, alignItems: 'flex-start',
   },
-  statusInfo: {
-    flex: 1,
+  etaBigTime:  { fontSize: 22, fontWeight: '800', color: '#111827', lineHeight: 26 },
+  etaSubRow:   { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 4, marginTop: 2 },
+  etaSubTxt:   { fontSize: 12, color: '#6B7280', fontWeight: '500' },
+  etaDot:      { fontSize: 12, color: '#9CA3AF' },
+
+  // bottom sheet
+  sheet: {
+    position: 'absolute', bottom: 0, left: 0, right: 0,
+    backgroundColor: '#fff',
+    borderTopLeftRadius: 24, borderTopRightRadius: 24,
+    paddingHorizontal: 20, paddingTop: 8,
+    shadowColor: '#000', shadowOffset: { width: 0, height: -4 }, shadowOpacity: 0.12, shadowRadius: 16, elevation: 16,
   },
-  statusText: {
-    fontSize: 20,
-    fontWeight: '700',
-    color: '#1a1a1a',
+  sheetHandle: { width: 40, height: 4, borderRadius: 2, backgroundColor: '#E5E7EB', alignSelf: 'center', marginBottom: 16 },
+
+  // driver row
+  driverRow: { flexDirection: 'row', alignItems: 'center', paddingTop: 16, paddingBottom: 4, gap: 12 },
+  driverAvatarWrap: { position: 'relative' },
+  driverAvatarLetter: { fontSize: 20, fontWeight: '800', color: '#fff',
+    width: 52, height: 52, borderRadius: 26, backgroundColor: '#16A34A',
+    textAlign: 'center', lineHeight: 52 },
+  onlineDot: { position: 'absolute', bottom: 2, right: 2, width: 12, height: 12, borderRadius: 6, backgroundColor: '#22C55E', borderWidth: 2, borderColor: '#fff' },
+  driverMeta: { flex: 1 },
+  driverNameTxt:  { fontSize: 18, fontWeight: '800', color: '#111827' },
+  driverVehicleTxt:{ fontSize: 13, color: '#6B7280', marginTop: 2 },
+  driverBtns: { flexDirection: 'row', gap: 8 },
+  iconBtn: { width: 40, height: 40, borderRadius: 20, justifyContent: 'center', alignItems: 'center' },
+  callBtn: { backgroundColor: '#16A34A' },
+  chatBtn: { backgroundColor: '#3B82F6' },
+
+  divider: { height: 1, backgroundColor: '#F3F4F6', marginVertical: 12 },
+
+  // route summary
+  routeRow: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingBottom: 12 },
+  routeDots: { alignItems: 'center', gap: 0 },
+  dot: { width: 10, height: 10, borderRadius: 5, borderWidth: 2 },
+  dotG: { backgroundColor: '#22C55E', borderColor: '#16A34A' },
+  dotO: { backgroundColor: '#F97316', borderColor: '#EA580C' },
+  routeVLine: { width: 2, height: 22, backgroundColor: '#D1FAE5', marginVertical: 2 },
+  routeAddrs: { flex: 1 },
+  routeAddrTxt: { fontSize: 13, color: '#374151', fontWeight: '500' },
+
+  // OTP strip
+  otpStrip: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    backgroundColor: '#FFFBEB', borderRadius: 12,
+    paddingHorizontal: 14, paddingVertical: 10,
     marginBottom: 4,
+    borderWidth: 1, borderColor: '#FDE68A',
   },
-  etaText: {
-    fontSize: 14,
-    color: '#666',
+  otpLabel: { fontSize: 12, fontWeight: '600', color: '#92400E' },
+  otpCode:  { fontSize: 16, fontWeight: '800', color: '#D97706', letterSpacing: 4, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' },
+  otpHint:  { fontSize: 11, color: '#B45309', marginLeft: 'auto' as any },
+
+  // ─── Trip completed overlay ──────────────────────────────
+  completedOverlay: {
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.72)',
+    justifyContent: 'center', alignItems: 'center',
+    zIndex: 9999, paddingHorizontal: 20,
   },
-  otpCard: {
-    backgroundColor: '#FFF3E0',
-    padding: 20,
-    marginHorizontal: 16,
-    marginBottom: 12,
-    borderRadius: 16,
-    borderWidth: 2,
-    borderColor: '#FF9800',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 4,
+  completedCard: {
+    backgroundColor: '#fff', borderRadius: 28,
+    padding: 28, width: '100%', alignItems: 'center',
   },
-  otpCardHeader: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    marginBottom: 16,
+  completedCircle: {
+    width: 96, height: 96, borderRadius: 48,
+    backgroundColor: '#16A34A',
+    justifyContent: 'center', alignItems: 'center',
+    marginBottom: 18,
+    shadowColor: '#16A34A', shadowOffset: { width: 0, height: 6 }, shadowOpacity: 0.45, shadowRadius: 16, elevation: 12,
   },
-  otpCardInfo: {
-    flex: 1,
-    marginLeft: 12,
+  completedTitle: { fontSize: 26, fontWeight: '800', color: '#111827', marginBottom: 6 },
+  completedSub:   { fontSize: 14, color: '#6B7280', textAlign: 'center', marginBottom: 20, lineHeight: 20 },
+  completedSummary: {
+    width: '100%', backgroundColor: '#F9FAFB',
+    borderRadius: 16, padding: 16, marginBottom: 22, gap: 10,
   },
-  otpCardTitle: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#1a1a1a',
-    marginBottom: 4,
+  completedSummaryRow: { flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 8 },
+  completedAvatar: {
+    width: 44, height: 44, borderRadius: 22, backgroundColor: '#16A34A',
+    justifyContent: 'center', alignItems: 'center',
   },
-  otpCardSubtitle: {
-    fontSize: 12,
-    color: '#666',
-    lineHeight: 18,
+  completedAvatarTxt:    { fontSize: 18, fontWeight: '800', color: '#fff' },
+  completedDriverName:   { fontSize: 15, fontWeight: '700', color: '#111827' },
+  completedDriverVehicle:{ fontSize: 12, color: '#6B7280', marginTop: 2 },
+  completedMetaRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  completedMetaTxt: { fontSize: 13, color: '#374151' },
+
+  rateBtn: {
+    width: '100%', height: 52, borderRadius: 16,
+    backgroundColor: '#F59E0B',
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
+    marginBottom: 10,
+    shadowColor: '#F59E0B', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.4, shadowRadius: 8, elevation: 6,
   },
-  otpDisplay: {
-    backgroundColor: '#fff',
-    padding: 20,
-    borderRadius: 12,
-    alignItems: 'center',
-    marginBottom: 12,
-    borderWidth: 2,
-    borderColor: '#FF9800',
-    borderStyle: 'dashed',
+  rateBtnTxt: { fontSize: 16, fontWeight: '800', color: '#fff' },
+  homeBtn: {
+    width: '100%', height: 52, borderRadius: 16,
+    backgroundColor: '#F3F4F6',
+    alignItems: 'center', justifyContent: 'center',
   },
-  otpText: {
-    fontSize: 32,
-    fontWeight: '700',
-    color: '#FF9800',
-    letterSpacing: 8,
-    fontFamily: 'monospace',
-  },
-  otpWarning: {
-    fontSize: 12,
-    color: '#f44336',
-    textAlign: 'center',
-    fontStyle: 'italic',
-  },
-  mapContainer: {
-    height: SCREEN_HEIGHT * 0.4,
-    marginHorizontal: 16,
-    marginBottom: 16,
-    borderRadius: 16,
-    overflow: 'hidden',
-  },
-  map: {
-    width: '100%',
-    height: '100%',
-  },
-  driverMarker: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    backgroundColor: '#fff',
-    justifyContent: 'center',
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.3,
-    shadowRadius: 4,
-    elevation: 4,
-    borderWidth: 2,
-    borderColor: '#2196F3',
-  },
-  distanceETAOverlay: {
-    position: 'absolute',
-    top: 100,
-    left: 16,
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 16,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.2,
-    shadowRadius: 8,
-    elevation: 4,
-    borderWidth: 1,
-    borderColor: '#e0e0e0',
-  },
-  distanceETARow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-  },
-  distanceETAText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: '#1a1a1a',
-  },
-  scrollContainer: {
-    flex: 1,
-  },
-  scrollContent: {
-    paddingBottom: 20,
-  },
-  driverCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    backgroundColor: '#fff',
-    padding: 20,
-    marginHorizontal: 16,
-    marginBottom: 12,
-    borderRadius: 16,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 4,
-  },
-  driverInfo: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flex: 1,
-  },
-  driverAvatar: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
-    backgroundColor: '#4CAF50',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginRight: 16,
-  },
-  driverAvatarText: {
-    fontSize: 24,
-    fontWeight: '700',
-    color: '#fff',
-  },
-  driverDetails: {
-    flex: 1,
-  },
-  driverName: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#1a1a1a',
-    marginBottom: 4,
-  },
-  vehicleInfo: {
-    fontSize: 14,
-    color: '#666',
-  },
-  driverActions: {
-    flexDirection: 'row',
-    gap: 12,
-  },
-  actionButton: {
-    width: 48,
-    height: 48,
-    borderRadius: 24,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  callButton: {
-    backgroundColor: '#4CAF50',
-  },
-  chatButton: {
-    backgroundColor: '#2196F3',
-  },
-  tripInfoCard: {
-    backgroundColor: '#fff',
-    padding: 20,
-    marginHorizontal: 16,
-    marginBottom: 16,
-    borderRadius: 16,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 4,
-  },
-  tripInfoRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    marginBottom: 20,
-  },
-  tripInfoText: {
-    flex: 1,
-    marginLeft: 12,
-  },
-  tripInfoLabel: {
-    fontSize: 12,
-    color: '#999',
-    marginBottom: 4,
-    textTransform: 'uppercase',
-    fontWeight: '600',
-  },
-  tripInfoValue: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#1a1a1a',
-  },
+  homeBtnTxt: { fontSize: 15, fontWeight: '700', color: '#374151' },
 });
 

@@ -2,9 +2,12 @@ import React, { createContext, useContext, useState, useEffect, useRef, ReactNod
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { io, Socket } from 'socket.io-client';
 import { SOCKET_URL } from '../lib/env';
-import { notificationsAPI } from '../services/api';
+import { notificationsAPI, customerAPI } from '../services/api';
 import * as Haptics from 'expo-haptics';
-import { AppState } from 'react-native';
+import { AppState, Platform } from 'react-native';
+import * as Notifications from 'expo-notifications';
+import * as Location from 'expo-location';
+import Constants from 'expo-constants';
 
 interface NotificationContextType {
   unreadCount: number;
@@ -24,6 +27,10 @@ export const NotificationProvider = ({ children }: { children: ReactNode }) => {
   const socketRef = useRef<Socket | null>(null);
 
   const refreshUnreadCount = async () => {
+    // Don't fetch if user is not logged in
+    const token = await AsyncStorage.getItem('userToken');
+    if (!token) return;
+
     // Throttle: Don't refresh if called within last 5 seconds
     const now = Date.now();
     if (now - lastRefreshTimeRef.current < 5000) {
@@ -68,7 +75,62 @@ export const NotificationProvider = ({ children }: { children: ReactNode }) => {
     };
     
     requestNotificationPermissions();
-    
+
+    // Register Expo push token with the backend so Khali Gadi can notify this customer
+    const registerPushToken = async () => {
+      try {
+        const token = await AsyncStorage.getItem('userToken');
+        if (!token) return;
+        const { status } = await Notifications.getPermissionsAsync();
+        if (status !== 'granted') {
+          console.log('[PushToken] Permission not granted:', status);
+          return;
+        }
+        // SDK 50+ requires projectId — get from EAS config or app.json extra
+        const projectId =
+          Constants.easConfig?.projectId ||
+          Constants.expoConfig?.extra?.eas?.projectId ||
+          Constants.expoConfig?.extra?.projectId;
+        console.log('[PushToken] projectId:', projectId);
+        const pushToken = await Notifications.getExpoPushTokenAsync(
+          projectId ? { projectId } : undefined
+        );
+        console.log('[PushToken] Expo push token:', pushToken?.data);
+        if (pushToken?.data) {
+          await customerAPI.savePushToken(
+            pushToken.data,
+            Platform.OS,
+            pushToken.data, // use token as deviceId
+          );
+          console.log('[PushToken] Token saved to backend');
+        }
+      } catch (err: any) {
+        console.error('[PushToken] Failed to register push token:', err?.message || err);
+      }
+    };
+
+    // Save customer GPS location so Khali Gadi proximity query works
+    const saveLocation = async () => {
+      try {
+        const token = await AsyncStorage.getItem('userToken');
+        if (!token) return;
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          console.log('[Location] Permission not granted:', status);
+          return;
+        }
+        const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+        console.log('[Location] Got GPS:', loc.coords.latitude, loc.coords.longitude);
+        await customerAPI.updateLocation(loc.coords.latitude, loc.coords.longitude);
+        console.log('[Location] Saved to backend');
+      } catch (err: any) {
+        console.error('[Location] Failed to save location:', err?.message || err);
+      }
+    };
+
+    registerPushToken();
+    saveLocation();
+
     // Initial load
     refreshUnreadCount();
 
@@ -116,7 +178,7 @@ export const NotificationProvider = ({ children }: { children: ReactNode }) => {
           
           // Haptic feedback - stronger vibration
           Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-          Haptics.impactAsync(Haptics.ImpactFeedbackType.Medium);
+          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
           
           // Auto-clear last notification after 5 seconds
           setTimeout(() => {
@@ -195,8 +257,62 @@ export const NotificationProvider = ({ children }: { children: ReactNode }) => {
 
         // Listen for notification deletion
         newSocket.on('notification-deleted', (data: { notificationId: string }) => {
-          // Refresh count when notification is deleted
           refreshUnreadCount();
+        });
+
+        // Listen for Khali Gadi announcements — filter by customer's own GPS
+        newSocket.on('khali-gadi', async (data: any) => {
+          console.log('🚛 Khali Gadi event received:', data);
+          try {
+            // Get customer's current GPS position
+            const { status } = await Location.getForegroundPermissionsAsync();
+            if (status !== 'granted') {
+              console.log('[KhaliGadi] Location permission not granted — showing anyway');
+            } else {
+              const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+              const customerLat = loc.coords.latitude;
+              const customerLng = loc.coords.longitude;
+
+              // Haversine distance in km
+              const R = 6371;
+              const dLat = (data.fromLat - customerLat) * Math.PI / 180;
+              const dLng = (data.fromLng - customerLng) * Math.PI / 180;
+              const a = Math.sin(dLat / 2) ** 2 +
+                Math.cos(customerLat * Math.PI / 180) * Math.cos(data.fromLat * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+              const distKm = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+              console.log(`[KhaliGadi] Distance to driver: ${distKm.toFixed(2)} km`);
+
+              if (distKm > 10) {
+                console.log('[KhaliGadi] Customer too far, ignoring');
+                return;
+              }
+            }
+
+            // Show local push notification
+            const { notificationService } = await import('../services/notificationService');
+            await notificationService.sendNotification(
+              `🚛 Khali Gadi: ${data.fromCity} → ${data.toCity}`,
+              `${data.driverName} (${data.vehicleType}) is heading ${data.fromCity}→${data.toCity} at ${data.depStr}. Tap to contact.`,
+              { type: 'KHALI_GADI', offerId: data.offerId, driverId: data.driverId }
+            );
+
+            // Show in-app banner
+            setLastNotification({
+              id: `khali-gadi-${data.offerId}`,
+              title: `🚛 Khali Gadi: ${data.fromCity} → ${data.toCity}`,
+              message: `${data.driverName} (${data.vehicleType}) departing at ${data.depStr}`,
+              type: 'KHALI_GADI',
+              offerId: data.offerId,
+              driverId: data.driverId,
+              timestamp: Date.now(),
+            });
+
+            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+
+            setTimeout(() => setLastNotification(null), 8000);
+          } catch (err: any) {
+            console.error('[KhaliGadi] Error handling socket event:', err?.message);
+          }
         });
 
         setSocket(newSocket);
