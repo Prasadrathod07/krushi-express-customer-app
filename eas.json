@@ -1,0 +1,27 @@
+{
+  "cli": {
+    "version": ">= 16.0.0"
+  },
+  "build": {
+    "preview": {
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease",
+        "env": {
+          "MAPBOX_DOWNLOAD_TOKEN": "$MAPBOX_DOWNLOAD_TOKEN"
+        }
+      }
+    },
+    "production": {
+      "android": {
+        "buildType": "app-bundle",
+        "env": {
+          "MAPBOX_DOWNLOAD_TOKEN": "$MAPBOX_DOWNLOAD_TOKEN"
+        }
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

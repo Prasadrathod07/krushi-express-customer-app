@@ -18,7 +18,9 @@ import { useRouter, useLocalSearchParams } from 'expo-router';
 import React, { useState, useEffect, useRef } from 'react';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import * as Haptics from 'expo-haptics';
-import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
+import MapboxGL from '@rnmapbox/maps';
+import Constants from 'expo-constants';
+MapboxGL.setAccessToken(Constants.expoConfig?.extra?.MAPBOX_TOKEN || '');
 import { tripsAPI } from '../services/tripsAPI';
 import { io, Socket } from 'socket.io-client';
 import { SOCKET_URL } from '../lib/env';
@@ -107,7 +109,8 @@ export default function TripTracking() {
   const routeFetchTimeout = useRef<NodeJS.Timeout | null>(null);
   const locationPollInterval = useRef<NodeJS.Timeout | null>(null);
 
-  const mapRef = useRef<MapView>(null);
+  const mapRef    = useRef<MapboxGL.MapView>(null);
+  const cameraRef = useRef<MapboxGL.Camera>(null);
   const driverCancelHandledRef = useRef(false);
   
   // Calculate bearing between two coordinates (in degrees)
@@ -253,28 +256,24 @@ export default function TripTracking() {
   }, [driverLocation, trip?.currentTripState, tripId]);
 
   useEffect(() => {
-    if (!driverLocation || !mapRef.current) return;
+    if (!driverLocation || !cameraRef.current) return;
     const state = trip?.currentTripState;
     if (state === 'ACCEPTED' || state === 'ENROUTE_TO_PICKUP') {
-      // Fit map to show both driver and pickup
       if (trip?.pickupLocation) {
         const pickup = { latitude: trip.pickupLocation.coordinates[1], longitude: trip.pickupLocation.coordinates[0] };
-        mapRef.current.fitToCoordinates([driverLocation, pickup], {
-          edgePadding: { top: 60, right: 40, bottom: 80, left: 40 },
-          animated: true,
-        });
+        const lats = [driverLocation.latitude, pickup.latitude];
+        const lngs = [driverLocation.longitude, pickup.longitude];
+        cameraRef.current.fitBounds([Math.max(...lngs), Math.max(...lats)], [Math.min(...lngs), Math.min(...lats)], [60, 40, 80, 40], 600);
       }
     } else if (state === 'PICKED_UP' || state === 'ENROUTE_TO_DELIVERY') {
-      // Fit map to show driver and drop
       if (trip?.dropLocation) {
         const drop = { latitude: trip.dropLocation.coordinates[1], longitude: trip.dropLocation.coordinates[0] };
-        mapRef.current.fitToCoordinates([driverLocation, drop], {
-          edgePadding: { top: 60, right: 40, bottom: 80, left: 40 },
-          animated: true,
-        });
+        const lats = [driverLocation.latitude, drop.latitude];
+        const lngs = [driverLocation.longitude, drop.longitude];
+        cameraRef.current.fitBounds([Math.max(...lngs), Math.max(...lats)], [Math.min(...lngs), Math.min(...lats)], [60, 40, 80, 40], 600);
       }
     } else {
-      mapRef.current.animateToRegion({ ...driverLocation, latitudeDelta: 0.01, longitudeDelta: 0.01 }, 1000);
+      cameraRef.current.setCamera({ centerCoordinate: [driverLocation.longitude, driverLocation.latitude], zoomLevel: 15, animationDuration: 1000 });
     }
   }, [driverLocation]);
 
@@ -741,85 +740,41 @@ export default function TripTracking() {
       <StatusBar barStyle="dark-content" translucent backgroundColor="transparent" />
 
       {/* ── Full-screen map ── */}
-      <MapView
-        ref={mapRef}
-        provider={PROVIDER_GOOGLE}
-        style={s.map}
-        initialRegion={{ ...pickupLL, latitudeDelta: 0.06, longitudeDelta: 0.06 }}
-        showsUserLocation={false}
-        showsMyLocationButton={false}
-        showsCompass={false}
-        mapType="standard"
-        scrollEnabled
-        zoomEnabled
-      >
-        {/* Pickup pin */}
-        <Marker coordinate={pickupLL} anchor={{ x: 0.5, y: 1 }}>
-          <View style={s.pinWrap}>
-            <View style={[s.pin, s.pinGreen]}>
-              <Icon name="location-on" size={18} color="#fff" />
-            </View>
-            <View style={[s.pinTip, { borderTopColor: '#16A34A' }]} />
-          </View>
-        </Marker>
+      <MapboxGL.MapView ref={mapRef} style={s.map} styleURL={MapboxGL.StyleURL.Street} logoEnabled={false} attributionEnabled={false}>
+        <MapboxGL.Camera ref={cameraRef} zoomLevel={13} centerCoordinate={[pickupLL.longitude, pickupLL.latitude]} animationMode="flyTo" />
 
-        {/* Drop pin */}
-        <Marker coordinate={dropLL} anchor={{ x: 0.5, y: 1 }}>
-          <View style={s.pinWrap}>
-            <View style={[s.pin, s.pinOrange]}>
-              <Icon name="flag" size={18} color="#fff" />
-            </View>
-            <View style={[s.pinTip, { borderTopColor: '#EA580C' }]} />
-          </View>
-        </Marker>
+        <MapboxGL.PointAnnotation id="pickup" coordinate={[pickupLL.longitude, pickupLL.latitude]}>
+          <View style={s.pinWrap}><View style={[s.pin, s.pinGreen]}><Icon name="location-on" size={18} color="#fff" /></View><View style={[s.pinTip, { borderTopColor: '#16A34A' }]} /></View>
+        </MapboxGL.PointAnnotation>
 
-        {/* Driver marker — vehicle-specific SVG with direction */}
+        <MapboxGL.PointAnnotation id="drop" coordinate={[dropLL.longitude, dropLL.latitude]}>
+          <View style={s.pinWrap}><View style={[s.pin, s.pinOrange]}><Icon name="flag" size={18} color="#fff" /></View><View style={[s.pinTip, { borderTopColor: '#EA580C' }]} /></View>
+        </MapboxGL.PointAnnotation>
+
         {driverLocation && (
-          <Marker coordinate={driverLocation} anchor={{ x: 0.5, y: 0.5 }} flat tracksViewChanges={false}>
-            <VehicleMarker
-              vehicleType={driverVehicle}
-              heading={driverHeading}
-              size={52}
-            />
-          </Marker>
+          <MapboxGL.PointAnnotation id="driver" coordinate={[driverLocation.longitude, driverLocation.latitude]}>
+            <VehicleMarker vehicleType={driverVehicle} heading={driverHeading} size={52} />
+          </MapboxGL.PointAnnotation>
         )}
 
-        {/* Route: driver → pickup — white border + blue fill (Google Maps style) */}
-        {driverLocation && ['ACCEPTED','ENROUTE_TO_PICKUP'].includes(trip.currentTripState) && <>
-          <Polyline
-            coordinates={routeCoordinates.length > 1 ? routeCoordinates : [driverLocation, pickupLL]}
-            strokeColor="#fff"
-            strokeWidth={9}
-            lineCap="round"
-            lineJoin="round"
-          />
-          <Polyline
-            coordinates={routeCoordinates.length > 1 ? routeCoordinates : [driverLocation, pickupLL]}
-            strokeColor="#1A73E8"
-            strokeWidth={6}
-            lineCap="round"
-            lineJoin="round"
-          />
-        </>}
+        {driverLocation && ['ACCEPTED','ENROUTE_TO_PICKUP'].includes(trip.currentTripState) && (() => {
+          const coords = (routeCoordinates.length > 1 ? routeCoordinates : [driverLocation, pickupLL]).map(c => [c.longitude, c.latitude]);
+          const geo = { type: 'Feature' as const, geometry: { type: 'LineString' as const, coordinates: coords }, properties: {} };
+          return <MapboxGL.ShapeSource id="pickupRoute" shape={geo}>
+            <MapboxGL.LineLayer id="pickupRouteBorder" style={{ lineColor: '#fff', lineWidth: 9, lineCap: 'round', lineJoin: 'round' }} />
+            <MapboxGL.LineLayer id="pickupRouteFill" style={{ lineColor: '#1A73E8', lineWidth: 6, lineCap: 'round', lineJoin: 'round' }} />
+          </MapboxGL.ShapeSource>;
+        })()}
 
-        {/* Route: pickup → drop — white border + green fill */}
-        {['PICKED_UP','ENROUTE_TO_DELIVERY','ARRIVED_AT_DELIVERY','DELIVERING'].includes(trip.currentTripState) && <>
-          <Polyline
-            coordinates={dropRouteCoordinates.length > 1 ? dropRouteCoordinates : [pickupLL, dropLL]}
-            strokeColor="#fff"
-            strokeWidth={9}
-            lineCap="round"
-            lineJoin="round"
-          />
-          <Polyline
-            coordinates={dropRouteCoordinates.length > 1 ? dropRouteCoordinates : [pickupLL, dropLL]}
-            strokeColor="#16A34A"
-            strokeWidth={6}
-            lineCap="round"
-            lineJoin="round"
-          />
-        </>}
-      </MapView>
+        {['PICKED_UP','ENROUTE_TO_DELIVERY','ARRIVED_AT_DELIVERY','DELIVERING'].includes(trip.currentTripState) && (() => {
+          const coords = (dropRouteCoordinates.length > 1 ? dropRouteCoordinates : [pickupLL, dropLL]).map(c => [c.longitude, c.latitude]);
+          const geo = { type: 'Feature' as const, geometry: { type: 'LineString' as const, coordinates: coords }, properties: {} };
+          return <MapboxGL.ShapeSource id="dropRoute" shape={geo}>
+            <MapboxGL.LineLayer id="dropRouteBorder" style={{ lineColor: '#fff', lineWidth: 9, lineCap: 'round', lineJoin: 'round' }} />
+            <MapboxGL.LineLayer id="dropRouteFill" style={{ lineColor: '#16A34A', lineWidth: 6, lineCap: 'round', lineJoin: 'round' }} />
+          </MapboxGL.ShapeSource>;
+        })()}
+      </MapboxGL.MapView>
 
       {/* ── Floating top bar ── */}
       <View style={[s.topBar, { paddingTop: insets.top + 8 }]}>

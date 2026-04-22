@@ -19,7 +19,9 @@ import React from 'react';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import * as Haptics from 'expo-haptics';
 import * as Location from 'expo-location';
-import MapView, { Marker, PROVIDER_GOOGLE } from 'react-native-maps';
+import MapboxGL from '@rnmapbox/maps';
+import Constants from 'expo-constants';
+MapboxGL.setAccessToken(Constants.expoConfig?.extra?.MAPBOX_TOKEN || '');
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { placesAPI, PlaceSuggestion } from '../services/placesAPI';
@@ -49,7 +51,8 @@ export default function SelectLocation() {
   } | null>(null);
   const [inputFocused, setInputFocused]   = useState(false);
 
-  const mapRef             = useRef<MapView>(null);
+  const mapRef    = useRef<MapboxGL.MapView>(null);
+  const cameraRef = useRef<MapboxGL.Camera>(null);
   const searchTimeoutRef   = useRef<NodeJS.Timeout | null>(null);
   const inputRef           = useRef<TextInput>(null);
   const suggestionAnim     = useRef(new Animated.Value(0)).current;
@@ -72,12 +75,12 @@ export default function SelectLocation() {
   }, []);
 
   useEffect(() => {
-    if (selectedLocation && mapRef.current) {
-      mapRef.current.animateToRegion({
-        ...selectedLocation,
-        latitudeDelta: 0.01,
-        longitudeDelta: 0.01,
-      }, 500);
+    if (selectedLocation && cameraRef.current) {
+      cameraRef.current.setCamera({
+        centerCoordinate: [selectedLocation.longitude, selectedLocation.latitude],
+        zoomLevel: 15,
+        animationDuration: 500,
+      });
     }
   }, [selectedLocation]);
 
@@ -122,7 +125,7 @@ export default function SelectLocation() {
       const coords = { latitude: loc.coords.latitude, longitude: loc.coords.longitude };
       setCurrentLocation(coords);
       // Only center the map — do NOT auto-select current location as the pickup/drop point
-      mapRef.current?.animateToRegion({ ...coords, latitudeDelta: 0.05, longitudeDelta: 0.05 }, 1000);
+      cameraRef.current?.setCamera({ centerCoordinate: [coords.longitude, coords.latitude], zoomLevel: 13, animationDuration: 1000 });
     } catch (e) { console.error('Location error:', e); }
   };
 
@@ -175,13 +178,13 @@ export default function SelectLocation() {
         const [lat, lng] = suggestion.placeId.replace('geocode_', '').split('_');
         const loc = { latitude: parseFloat(lat), longitude: parseFloat(lng), address: suggestion.description };
         setSelectedLocation(loc);
-        mapRef.current?.animateToRegion({ ...loc, latitudeDelta: 0.01, longitudeDelta: 0.01 }, 800);
+        cameraRef.current?.setCamera({ centerCoordinate: [loc.longitude, loc.latitude], zoomLevel: 15, animationDuration: 800 });
       } else {
         const response = await placesAPI.getPlaceDetails(suggestion.placeId);
         if (response.ok && response.data) {
           const loc = { latitude: response.data.latitude, longitude: response.data.longitude, address: response.data.address };
           setSelectedLocation(loc);
-          mapRef.current?.animateToRegion({ ...loc, latitudeDelta: 0.01, longitudeDelta: 0.01 }, 800);
+          cameraRef.current?.setCamera({ centerCoordinate: [loc.longitude, loc.latitude], zoomLevel: 15, animationDuration: 800 });
         }
       }
     } catch { Alert.alert('Error', 'Failed to get location details. Please try again.'); }
@@ -200,7 +203,7 @@ export default function SelectLocation() {
       setSelectedLocation({ latitude, longitude, address: addressString });
       suppressSearchRef.current = true;
       setSearchQuery(addressString);
-      mapRef.current?.animateToRegion({ latitude, longitude, latitudeDelta: 0.01, longitudeDelta: 0.01 }, 600);
+      cameraRef.current?.setCamera({ centerCoordinate: [longitude, latitude], zoomLevel: 15, animationDuration: 600 });
     } finally { setLoading(false); }
   };
 
@@ -216,7 +219,7 @@ export default function SelectLocation() {
       setSelectedLocation({ ...currentLocation, address: addressString });
       suppressSearchRef.current = true;
       setSearchQuery(addressString);
-      mapRef.current?.animateToRegion({ ...currentLocation, latitudeDelta: 0.015, longitudeDelta: 0.015 }, 800);
+      cameraRef.current?.setCamera({ centerCoordinate: [currentLocation.longitude, currentLocation.latitude], zoomLevel: 14, animationDuration: 800 });
     } finally { setLoading(false); }
   };
 
@@ -390,24 +393,33 @@ export default function SelectLocation() {
       {/* ── Map ────────────────────────────────────────────── */}
       <View style={styles.mapWrap}>
         {currentLocation ? (
-          <MapView
+          <MapboxGL.MapView
             ref={mapRef}
-            provider={PROVIDER_GOOGLE}
             style={styles.map}
-            initialRegion={{ ...currentLocation, latitudeDelta: 0.05, longitudeDelta: 0.05 }}
-            onPress={handleMapPress}
-            showsUserLocation
-            showsMyLocationButton={false}
-            mapType="standard"
+            styleURL={MapboxGL.StyleURL.Street}
+            logoEnabled={false}
+            attributionEnabled={false}
+            onPress={(e: any) => {
+              const [longitude, latitude] = e.geometry.coordinates;
+              handleMapPress({ nativeEvent: { coordinate: { latitude, longitude } } } as any);
+            }}
           >
+            <MapboxGL.Camera
+              ref={cameraRef}
+              zoomLevel={13}
+              centerCoordinate={[currentLocation.longitude, currentLocation.latitude]}
+              animationMode="flyTo"
+            />
+            <MapboxGL.UserLocation visible={true} />
             {selectedLocation && (
-              <Marker
-                coordinate={{ latitude: selectedLocation.latitude, longitude: selectedLocation.longitude }}
-                title={selectedLocation.address}
-                pinColor={isPickup ? '#2E7D32' : '#E65100'}
-              />
+              <MapboxGL.PointAnnotation
+                id="selectedLocation"
+                coordinate={[selectedLocation.longitude, selectedLocation.latitude]}
+              >
+                <View style={{ width: 18, height: 18, borderRadius: 9, backgroundColor: isPickup ? '#2E7D32' : '#E65100', borderWidth: 2, borderColor: '#fff' }} />
+              </MapboxGL.PointAnnotation>
             )}
-          </MapView>
+          </MapboxGL.MapView>
         ) : (
           <View style={styles.mapPlaceholder}>
             <ActivityIndicator size="large" color={accentColor} />

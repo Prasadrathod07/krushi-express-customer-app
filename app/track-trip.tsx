@@ -14,7 +14,9 @@ import {
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import Icon from 'react-native-vector-icons/MaterialIcons';
-import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
+import MapboxGL from '@rnmapbox/maps';
+import Constants from 'expo-constants';
+MapboxGL.setAccessToken(Constants.expoConfig?.extra?.MAPBOX_TOKEN || '');
 import { useTrip } from '../contexts/TripContext';
 import { tripsAPI } from '../services/tripsAPI';
 import { socketManager } from '../services/socketManager';
@@ -58,7 +60,8 @@ export default function TrackTripScreen() {
   const [eta, setEta] = useState<number | null>(null);
   const [etaDist, setEtaDist] = useState<number | null>(null);
 
-  const mapRef  = useRef<MapView>(null);
+  const mapRef    = useRef<MapboxGL.MapView>(null);
+  const cameraRef = useRef<MapboxGL.Camera>(null);
   const tripRef = useRef<any>(trip);
   useEffect(() => { tripRef.current = trip; }, [trip]);
 
@@ -80,11 +83,15 @@ export default function TrackTripScreen() {
   // ── fit map ───────────────────────────────────────────────────────────────
   const fitMap = useCallback(
     (coords: { latitude: number; longitude: number }[]) => {
-      if (!mapRef.current || coords.length === 0) return;
-      mapRef.current.fitToCoordinates(coords, {
-        edgePadding: { top: 120, right: 40, bottom: 320, left: 40 },
-        animated: true,
-      });
+      if (!cameraRef.current || coords.length === 0) return;
+      const lats = coords.map(c => c.latitude);
+      const lngs = coords.map(c => c.longitude);
+      cameraRef.current.fitBounds(
+        [Math.max(...lngs), Math.max(...lats)],
+        [Math.min(...lngs), Math.min(...lats)],
+        [120, 40, 320, 40],
+        600
+      );
     },
     []
   );
@@ -269,73 +276,43 @@ export default function TrackTripScreen() {
       <StatusBar barStyle="dark-content" backgroundColor="transparent" translucent />
 
       {/* Full-screen Map */}
-      <MapView
-        ref={mapRef}
-        style={styles.map}
-        initialRegion={{
-          latitude: pickupLatLng.latitude,
-          longitude: pickupLatLng.longitude,
-          latitudeDelta: 0.08,
-          longitudeDelta: 0.08,
-        }}
-        showsUserLocation={false}
-        showsMyLocationButton={false}
-        showsTraffic={false}
-        mapType="standard"
-      >
-        {/* ── Pickup→Drop full route (grey background line) ── */}
-        {fullRoute.length > 1 && (
-          <Polyline
-            coordinates={fullRoute}
-            strokeColor="#BDBDBD"
-            strokeWidth={4}
-          />
-        )}
+      <MapboxGL.MapView ref={mapRef} style={styles.map} styleURL={MapboxGL.StyleURL.Street} logoEnabled={false} attributionEnabled={false}>
+        <MapboxGL.Camera ref={cameraRef} zoomLevel={13} centerCoordinate={[pickupLatLng.longitude, pickupLatLng.latitude]} animationMode="flyTo" />
 
-        {/* ── Driver→Target active route (coloured line) ── */}
-        {driverRoute.length > 1 && (
-          <Polyline
-            coordinates={driverRoute}
-            strokeColor={isDeliveryPhase(trip?.currentTripState) ? '#FF9800' : '#2196F3'}
-            strokeWidth={5}
-            lineCap="round"
-            lineJoin="round"
-          />
-        )}
+        {fullRoute.length > 1 && (() => {
+          const geo = { type: 'Feature' as const, geometry: { type: 'LineString' as const, coordinates: fullRoute.map(c => [c.longitude, c.latitude]) }, properties: {} };
+          return <MapboxGL.ShapeSource id="fullRoute" shape={geo}><MapboxGL.LineLayer id="fullRouteLine" style={{ lineColor: '#BDBDBD', lineWidth: 4 }} /></MapboxGL.ShapeSource>;
+        })()}
 
-        {/* ── Pickup marker ── */}
+        {driverRoute.length > 1 && (() => {
+          const geo = { type: 'Feature' as const, geometry: { type: 'LineString' as const, coordinates: driverRoute.map(c => [c.longitude, c.latitude]) }, properties: {} };
+          return <MapboxGL.ShapeSource id="driverRoute" shape={geo}><MapboxGL.LineLayer id="driverRouteLine" style={{ lineColor: isDeliveryPhase(trip?.currentTripState) ? '#FF9800' : '#2196F3', lineWidth: 5, lineCap: 'round', lineJoin: 'round' }} /></MapboxGL.ShapeSource>;
+        })()}
+
         {pickupLatLng && (
-          <Marker coordinate={pickupLatLng} title="Pickup" description={trip?.pickupLocation?.address} anchor={{ x: 0.5, y: 1 }}>
+          <MapboxGL.PointAnnotation id="pickup" coordinate={[pickupLatLng.longitude, pickupLatLng.latitude]}>
             <View style={styles.markerWrapper}>
-              <View style={[styles.markerPin, { backgroundColor: '#4CAF50' }]}>
-                <Icon name="location-on" size={18} color="#fff" />
-              </View>
+              <View style={[styles.markerPin, { backgroundColor: '#4CAF50' }]}><Icon name="location-on" size={18} color="#fff" /></View>
               <View style={[styles.markerTail, { borderTopColor: '#4CAF50' }]} />
             </View>
-          </Marker>
+          </MapboxGL.PointAnnotation>
         )}
 
-        {/* ── Drop marker ── */}
         {dropLatLng && (
-          <Marker coordinate={dropLatLng} title="Drop" description={(trip?.dropLocation || trip?.dropoffLocation)?.address} anchor={{ x: 0.5, y: 1 }}>
+          <MapboxGL.PointAnnotation id="drop" coordinate={[dropLatLng.longitude, dropLatLng.latitude]}>
             <View style={styles.markerWrapper}>
-              <View style={[styles.markerPin, { backgroundColor: '#FF9800' }]}>
-                <Icon name="place" size={18} color="#fff" />
-              </View>
+              <View style={[styles.markerPin, { backgroundColor: '#FF9800' }]}><Icon name="place" size={18} color="#fff" /></View>
               <View style={[styles.markerTail, { borderTopColor: '#FF9800' }]} />
             </View>
-          </Marker>
+          </MapboxGL.PointAnnotation>
         )}
 
-        {/* ── Driver marker ── */}
         {driverLoc && (
-          <Marker coordinate={driverLoc} title={driver?.name || 'Driver'} anchor={{ x: 0.5, y: 0.5 }}>
-            <View style={styles.driverMarker}>
-              <Icon name="directions-car" size={24} color="#1565C0" />
-            </View>
-          </Marker>
+          <MapboxGL.PointAnnotation id="driver" coordinate={[driverLoc.longitude, driverLoc.latitude]}>
+            <View style={styles.driverMarker}><Icon name="directions-car" size={24} color="#1565C0" /></View>
+          </MapboxGL.PointAnnotation>
         )}
-      </MapView>
+      </MapboxGL.MapView>
 
       {/* ── Floating back button ── */}
       <TouchableOpacity

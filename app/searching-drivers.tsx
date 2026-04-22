@@ -7,7 +7,9 @@ import { useRouter, useLocalSearchParams } from 'expo-router';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import * as Haptics from 'expo-haptics';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import MapView, { Marker, PROVIDER_GOOGLE } from 'react-native-maps';
+import MapboxGL from '@rnmapbox/maps';
+import Constants from 'expo-constants';
+MapboxGL.setAccessToken(Constants.expoConfig?.extra?.MAPBOX_TOKEN || '');
 import { tripsAPI } from '../services/tripsAPI';
 import { socketManager } from '../services/socketManager';
 import { useTrip } from '../contexts/TripContext';
@@ -100,7 +102,8 @@ export default function SearchingDrivers() {
   const iconBounce   = useRef(new Animated.Value(0)).current;
   const cardSlide    = useRef(new Animated.Value(80)).current;
   const cardOpacity  = useRef(new Animated.Value(0)).current;
-  const mapRef       = useRef<MapView>(null);
+  const mapRef    = useRef<MapboxGL.MapView>(null);
+  const cameraRef = useRef<MapboxGL.Camera>(null);
 
   const pickupLocation = params.pickupLocation ? JSON.parse(params.pickupLocation as string) : null;
   const dropLocation   = params.dropLocation   ? JSON.parse(params.dropLocation   as string) : null;
@@ -113,11 +116,12 @@ export default function SearchingDrivers() {
   // ── Init ──────────────────────────────────────────────────────────────────
   useEffect(() => {
     // Map animation
-    if (pickupLocation && mapRef.current) {
-      mapRef.current.animateToRegion({
-        latitude: pickupLocation.latitude, longitude: pickupLocation.longitude,
-        latitudeDelta: 0.08, longitudeDelta: 0.08,
-      }, 800);
+    if (pickupLocation && cameraRef.current) {
+      cameraRef.current.setCamera({
+        centerCoordinate: [pickupLocation.longitude, pickupLocation.latitude],
+        zoomLevel: 12,
+        animationDuration: 800,
+      });
     }
     // Truck bounce
     Animated.loop(
@@ -391,16 +395,17 @@ export default function SearchingDrivers() {
 
       {/* Map */}
       {pickupLocation ? (
-        <MapView
-          ref={mapRef}
-          provider={PROVIDER_GOOGLE}
-          style={StyleSheet.absoluteFill}
-          initialRegion={{ latitude: pickupLocation.latitude, longitude: pickupLocation.longitude, latitudeDelta: 0.08, longitudeDelta: 0.08 }}
-          scrollEnabled={false} zoomEnabled={false} rotateEnabled={false} pitchEnabled={false}
-        >
-          <Marker coordinate={{ latitude: pickupLocation.latitude, longitude: pickupLocation.longitude }} pinColor="#2E7D32" title="Pickup" />
-          {dropLocation && <Marker coordinate={{ latitude: dropLocation.latitude, longitude: dropLocation.longitude }} pinColor="#E65100" title="Drop" />}
-        </MapView>
+        <MapboxGL.MapView ref={mapRef} style={StyleSheet.absoluteFill} styleURL={MapboxGL.StyleURL.Street} logoEnabled={false} attributionEnabled={false} scrollEnabled={false} zoomEnabled={false} rotateEnabled={false} pitchEnabled={false}>
+          <MapboxGL.Camera ref={cameraRef} zoomLevel={12} centerCoordinate={[pickupLocation.longitude, pickupLocation.latitude]} animationMode="flyTo" />
+          <MapboxGL.PointAnnotation id="pickup" coordinate={[pickupLocation.longitude, pickupLocation.latitude]}>
+            <View style={{ width: 16, height: 16, borderRadius: 8, backgroundColor: '#2E7D32', borderWidth: 2, borderColor: '#fff' }} />
+          </MapboxGL.PointAnnotation>
+          {dropLocation && (
+            <MapboxGL.PointAnnotation id="drop" coordinate={[dropLocation.longitude, dropLocation.latitude]}>
+              <View style={{ width: 16, height: 16, borderRadius: 8, backgroundColor: '#E65100', borderWidth: 2, borderColor: '#fff' }} />
+            </MapboxGL.PointAnnotation>
+          )}
+        </MapboxGL.MapView>
       ) : (
         <View style={[StyleSheet.absoluteFill, { backgroundColor: '#1B5E20' }]} />
       )}

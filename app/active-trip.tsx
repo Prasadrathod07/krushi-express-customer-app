@@ -19,7 +19,9 @@ import {
 import { useRouter, useLocalSearchParams } from 'expo-router';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import * as Haptics from 'expo-haptics';
-import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
+import MapboxGL from '@rnmapbox/maps';
+import Constants from 'expo-constants';
+MapboxGL.setAccessToken(Constants.expoConfig?.extra?.MAPBOX_TOKEN || '');
 import { tripsAPI } from '../services/tripsAPI';
 import { io, Socket } from 'socket.io-client';
 import { SOCKET_URL } from '../lib/env';
@@ -101,7 +103,8 @@ export default function ActiveTripScreen() {
   // Road route from pickup to drop (fetched once when trip loads)
   const [tripRouteCoordinates, setTripRouteCoordinates] = useState<Array<{ latitude: number; longitude: number }>>([]);
 
-  const mapRef = useRef<MapView>(null);
+  const mapRef    = useRef<MapboxGL.MapView>(null);
+  const cameraRef = useRef<MapboxGL.Camera>(null);
   const lastLocationRef = useRef<{ latitude: number; longitude: number } | null>(null);
 
   // CRITICAL: Sync with TripContext - activeTrip is source of truth
@@ -200,11 +203,11 @@ export default function ActiveTripScreen() {
       }
       
       lastLocationRef.current = driverLocation;
-      mapRef.current.animateToRegion({
-        ...driverLocation,
-        latitudeDelta: 0.01,
-        longitudeDelta: 0.01,
-      }, 1000);
+      cameraRef.current?.setCamera({
+        centerCoordinate: [driverLocation.longitude, driverLocation.latitude],
+        zoomLevel: 15,
+        animationDuration: 1000,
+      });
     }
   }, [driverLocation, trip?.currentTripState]);
 
@@ -515,71 +518,34 @@ export default function ActiveTripScreen() {
 
       {/* CRITICAL: Map - Always rendered first */}
       <View style={styles.mapContainer}>
-        <MapView
-          ref={mapRef}
-          provider={PROVIDER_GOOGLE}
-          style={styles.map}
-          initialRegion={{
-            latitude: pickupLatLng.latitude,
-            longitude: pickupLatLng.longitude,
-            latitudeDelta: 0.05,
-            longitudeDelta: 0.05,
-          }}
-          showsUserLocation={true}
-          showsMyLocationButton={false}
-          mapType="standard"
-        >
-          {/* Pickup Marker */}
-          <Marker
-            coordinate={pickupLatLng}
-            title="Pickup Location"
-            description={trip.pickupLocation.address}
-            pinColor="#4CAF50"
-          />
+        <MapboxGL.MapView ref={mapRef} style={styles.map} styleURL={MapboxGL.StyleURL.Street} logoEnabled={false} attributionEnabled={false}>
+          <MapboxGL.Camera ref={cameraRef} zoomLevel={13} centerCoordinate={[pickupLatLng.longitude, pickupLatLng.latitude]} animationMode="flyTo" />
 
-          {/* Drop Marker */}
-          <Marker
-            coordinate={dropLatLng}
-            title="Drop Location"
-            description={trip.dropLocation.address}
-            pinColor="#FF9800"
-          />
+          <MapboxGL.PointAnnotation id="pickup" coordinate={[pickupLatLng.longitude, pickupLatLng.latitude]}>
+            <View style={{ width: 16, height: 16, borderRadius: 8, backgroundColor: '#4CAF50', borderWidth: 2, borderColor: '#fff' }} />
+          </MapboxGL.PointAnnotation>
 
-          {/* Driver Location Marker - Only show when trip is ACCEPTED */}
+          <MapboxGL.PointAnnotation id="drop" coordinate={[dropLatLng.longitude, dropLatLng.latitude]}>
+            <View style={{ width: 16, height: 16, borderRadius: 8, backgroundColor: '#FF9800', borderWidth: 2, borderColor: '#fff' }} />
+          </MapboxGL.PointAnnotation>
+
           {driverLocation && (trip.currentTripState === 'ACCEPTED' || trip.currentTripState === 'ENROUTE_TO_PICKUP') && (
-            <Marker
-              coordinate={driverLocation}
-              title="Driver Location"
-              description="Driver is here"
-            >
-              <View style={styles.driverMarker}>
-                <Icon name="directions-car" size={32} color="#2196F3" />
-              </View>
-            </Marker>
+            <MapboxGL.PointAnnotation id="driver" coordinate={[driverLocation.longitude, driverLocation.latitude]}>
+              <View style={styles.driverMarker}><Icon name="directions-car" size={32} color="#2196F3" /></View>
+            </MapboxGL.PointAnnotation>
           )}
 
-          {/* Route Line from Driver to Pickup - road-based */}
-          {driverLocation && routeCoordinates.length > 0 && (trip.currentTripState === 'ACCEPTED' || trip.currentTripState === 'ENROUTE_TO_PICKUP') && (
-            <Polyline
-              coordinates={routeCoordinates}
-              strokeColor="#2196F3"
-              strokeWidth={5}
-            />
-          )}
-          
-          {/* Route Line from Pickup to Drop - road-based */}
-          {(trip.currentTripState === 'PICKED_UP' || trip.currentTripState === 'ENROUTE_TO_DELIVERY') && (
-            <Polyline
-              coordinates={
-                tripRouteCoordinates.length > 0
-                  ? tripRouteCoordinates
-                  : [pickupLatLng, dropLatLng]
-              }
-              strokeColor="#4CAF50"
-              strokeWidth={5}
-            />
-          )}
-        </MapView>
+          {driverLocation && routeCoordinates.length > 0 && (trip.currentTripState === 'ACCEPTED' || trip.currentTripState === 'ENROUTE_TO_PICKUP') && (() => {
+            const geo = { type: 'Feature' as const, geometry: { type: 'LineString' as const, coordinates: routeCoordinates.map(c => [c.longitude, c.latitude]) }, properties: {} };
+            return <MapboxGL.ShapeSource id="driverRoute" shape={geo}><MapboxGL.LineLayer id="driverRouteLine" style={{ lineColor: '#2196F3', lineWidth: 5 }} /></MapboxGL.ShapeSource>;
+          })()}
+
+          {(trip.currentTripState === 'PICKED_UP' || trip.currentTripState === 'ENROUTE_TO_DELIVERY') && (() => {
+            const coords = tripRouteCoordinates.length > 0 ? tripRouteCoordinates : [pickupLatLng, dropLatLng];
+            const geo = { type: 'Feature' as const, geometry: { type: 'LineString' as const, coordinates: coords.map(c => [c.longitude, c.latitude]) }, properties: {} };
+            return <MapboxGL.ShapeSource id="tripRoute" shape={geo}><MapboxGL.LineLayer id="tripRouteLine" style={{ lineColor: '#4CAF50', lineWidth: 5 }} /></MapboxGL.ShapeSource>;
+          })()}
+        </MapboxGL.MapView>
       </View>
 
       {/* Trip Details */}

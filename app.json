@@ -21,23 +21,37 @@
         "foregroundImage": "./assets/images/Krushi.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true,
+      "edgeToEdgeEnabled": false,
       "permissions": [
         "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION"
-      ]
+      ],
+      "package": "com.prasad_rathod_3.krushiexpress"
     },
     "web": {
       "favicon": "./assets/images/Krushi.png"
     },
     "plugins": [
-      "expo-secure-store"
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow Krushi Express to use your location for booking rides."
+        }
+      ],
+      "@rnmapbox/maps"
     ],
     "extra": {
-      
-      "SOCKET_IO_URL": "http://192.168.12.83:5000",
-      "API_BASE_URL": "http://192.168.12.83:5000",
-      "CLOUDINARY_CLOUD_NAME": "dvzg4pod2"
-    }
+      "API_BASE_URL": "https://krushi-express-backend.onrender.com",
+      "SOCKET_IO_URL": "https://krushi-express-backend.onrender.com",
+      "MAPBOX_TOKEN": "pk.eyJ1Ijoia3J1c2hpLWV4cHJlc3MtbWgyNCIsImEiOiJjbWRlcmoxb2QwNTVuMmxxeHR0eGw0eHB5In0.LS-wjw8x8SVqBX9siWigvQ",
+      "CLOUDINARY_CLOUD_NAME": "dvzg4pod2",
+      "eas": {
+        "projectId": "9bb3c471-2a5a-41d9-ab14-16ec464652d0"
+      }
+    },
+    "owner": "prasad_rathod_3"
   }
 }

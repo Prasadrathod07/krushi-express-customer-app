@@ -19,7 +19,9 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import Icon from 'react-native-vector-icons/MaterialIcons';
 import * as Haptics from 'expo-haptics';
 import * as Location from 'expo-location';
-import MapView, { Marker, Callout, PROVIDER_GOOGLE } from 'react-native-maps';
+import MapboxGL from '@rnmapbox/maps';
+import Constants from 'expo-constants';
+MapboxGL.setAccessToken(Constants.expoConfig?.extra?.MAPBOX_TOKEN || '');
 import { vehiclesAPI } from '../services/vehiclesAPI';
 import { permanentDriversAPI } from '../services/permanentDriversAPI';
 import { socketManager } from '../services/socketManager';
@@ -108,7 +110,8 @@ export default function Home() {
   // 5-min countdown for PENDING/REQUESTED trip request banner (null=idle, 0=expired, >0=seconds left)
   const [pendingSecondsLeft, setPendingSecondsLeft] = useState<number | null>(null);
   
-  const mapRef = useRef<MapView>(null);
+  const mapRef    = useRef<MapboxGL.MapView>(null);
+  const cameraRef = useRef<MapboxGL.Camera>(null);
   const locationWatchRef = useRef<Location.LocationSubscription | null>(null);
   
   // Bottom sheet animation values
@@ -367,12 +370,8 @@ export default function Home() {
 
       // Center map on user's real position (do NOT set pickupLocationCoords here —
       // the pickup marker should only appear when the user explicitly selects a location)
-      if (mapRef.current) {
-        mapRef.current.animateToRegion({
-          ...initialCoords,
-          latitudeDelta: 0.05,
-          longitudeDelta: 0.05,
-        }, 1000);
+      if (cameraRef.current) {
+        cameraRef.current.setCamera({ centerCoordinate: [initialCoords.longitude, initialCoords.latitude], zoomLevel: 13, animationDuration: 1000 });
       }
 
       // Stop any existing watcher before starting a new one
@@ -658,13 +657,8 @@ export default function Home() {
             });
             
             // Center map on pickup location
-            if (mapRef.current) {
-              mapRef.current.animateToRegion({
-                latitude: pickup.latitude,
-                longitude: pickup.longitude,
-                latitudeDelta: 0.05,
-                longitudeDelta: 0.05,
-              }, 1000);
+            if (cameraRef.current) {
+              cameraRef.current.setCamera({ centerCoordinate: [pickup.longitude, pickup.latitude], zoomLevel: 13, animationDuration: 1000 });
             }
             
             // Load drivers with new pickup location
@@ -910,26 +904,17 @@ export default function Home() {
     setSelectedVehicle(vehicle);
 
     // Animate map to vehicle location
-    if (mapRef.current && vehicle.currentLocation) {
-      mapRef.current.animateToRegion({
-        latitude: vehicle.currentLocation.latitude,
-        longitude: vehicle.currentLocation.longitude,
-        latitudeDelta: 0.01,
-        longitudeDelta: 0.01,
-      }, 500);
+    if (cameraRef.current && vehicle.currentLocation) {
+      cameraRef.current.setCamera({ centerCoordinate: [vehicle.currentLocation.longitude, vehicle.currentLocation.latitude], zoomLevel: 16, animationDuration: 500 });
     }
   };
 
   const handleMyLocation = () => {
     // Center on pickup location if set, otherwise user location
     const centerLocation = pickupLocationCoords || userLocation;
-    if (centerLocation && mapRef.current) {
+    if (centerLocation && cameraRef.current) {
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-      mapRef.current.animateToRegion({
-        ...centerLocation,
-        latitudeDelta: 0.05,
-        longitudeDelta: 0.05,
-      }, 1000);
+      cameraRef.current.setCamera({ centerCoordinate: [centerLocation.longitude, centerLocation.latitude], zoomLevel: 13, animationDuration: 1000 });
     }
   };
 
@@ -1149,116 +1134,56 @@ export default function Home() {
       {/* Map View */}
       <View style={styles.mapContainer}>
         {(pickupLocationCoords || userLocation) ? (
-          <MapView
-            ref={mapRef}
-            provider={PROVIDER_GOOGLE}
-            style={styles.map}
-            initialRegion={{
-              latitude: (pickupLocationCoords || userLocation)!.latitude,
-              longitude: (pickupLocationCoords || userLocation)!.longitude,
-              latitudeDelta: 0.05,
-              longitudeDelta: 0.05,
-            }}
-            showsUserLocation={true}
-            showsMyLocationButton={false}
-            mapType="standard"
-          >
-            {/* Pickup Location Marker */}
+          <MapboxGL.MapView ref={mapRef} style={styles.map} styleURL={MapboxGL.StyleURL.Street} logoEnabled={false} attributionEnabled={false}>
+            <MapboxGL.Camera
+              ref={cameraRef}
+              zoomLevel={13}
+              centerCoordinate={[(pickupLocationCoords || userLocation)!.longitude, (pickupLocationCoords || userLocation)!.latitude]}
+              animationMode="flyTo"
+            />
+            <MapboxGL.UserLocation visible={true} />
+
             {pickupLocationCoords && (
-              <Marker
-                coordinate={pickupLocationCoords}
-                title="Pickup Location"
-                description={pickupLocation}
-                pinColor="#4CAF50"
-              >
+              <MapboxGL.PointAnnotation id="pickup" coordinate={[pickupLocationCoords.longitude, pickupLocationCoords.latitude]}>
                 <View style={styles.pickupMarker}>
                   <Icon name="location-on" size={30} color="#4CAF50" />
                 </View>
-              </Marker>
+              </MapboxGL.PointAnnotation>
             )}
 
-            {/* User Location Marker (only if no pickup location) */}
-            {userLocation && !pickupLocationCoords && (
-              <Marker
-                coordinate={userLocation}
-                title="Your Location"
-                pinColor="#4CAF50"
-              />
-            )}
+            {filteredDrivers.filter(d => d.currentLocation?.coordinates).map((driver) => {
+              const [lon, lat] = driver.currentLocation!.coordinates;
+              const vehicleType = driver.vehicleDetails?.type || 'Tempo';
+              return (
+                <MapboxGL.PointAnnotation key={`driver-${driver._id}`} id={`driver-${driver._id}`} coordinate={[lon, lat]}>
+                  <View style={[styles.vehicleMarker, { backgroundColor: '#FFC107' }]}>
+                    <Icon name={getVehicleIcon(vehicleType)} size={22} color="#fff" />
+                  </View>
+                </MapboxGL.PointAnnotation>
+              );
+            })}
 
-            {/* Online Driver Markers — yellow pin + address callout */}
-            {filteredDrivers
-              .filter(d => d.currentLocation?.coordinates)
-              .map((driver) => {
-                const [lon, lat] = driver.currentLocation!.coordinates;
-                const vehicleType = driver.vehicleDetails?.type || 'Tempo';
-                const address = driver.currentLocation?.address
-                  || (driver.address && driver.city ? `${driver.address}, ${driver.city}` : null)
-                  || driver.city
-                  || 'On duty';
-                return (
-                  <Marker
-                    key={`driver-${driver._id}`}
-                    coordinate={{ latitude: lat, longitude: lon }}
-                    tracksViewChanges={false}
-                  >
-                    <View style={[styles.vehicleMarker, { backgroundColor: '#FFC107' }]}>
-                      <Icon name={getVehicleIcon(vehicleType)} size={22} color="#fff" />
-                    </View>
-                    <Callout tooltip={false}>
-                      <View style={styles.driverCallout}>
-                        <Text style={styles.driverCalloutType}>{vehicleType}</Text>
-                        <View style={styles.driverCalloutAddressRow}>
-                          <Icon name="location-on" size={12} color="#4CAF50" />
-                          <Text style={styles.driverCalloutAddress} numberOfLines={2}>
-                            {address}
-                          </Text>
-                        </View>
-                      </View>
-                    </Callout>
-                  </Marker>
-                );
-              })
-            }
-
-            {/* Nearby vehicle markers for drivers NOT already in filteredDrivers */}
             {vehicles
-              .filter(v => v.currentLocation !== null) // skip drivers without GPS
+              .filter(v => v.currentLocation !== null)
               .filter(v => !filteredDrivers.some(d =>
                 d.currentLocation?.coordinates &&
                 Math.abs(d.currentLocation.coordinates[1] - v.currentLocation!.latitude) < 0.0001 &&
                 Math.abs(d.currentLocation.coordinates[0] - v.currentLocation!.longitude) < 0.0001
               ))
               .map((vehicle) => (
-                <Marker
+                <MapboxGL.PointAnnotation
                   key={vehicle.vehicleId}
-                  coordinate={{
-                    latitude: vehicle.currentLocation!.latitude,
-                    longitude: vehicle.currentLocation!.longitude,
-                  }}
-                  tracksViewChanges={false}
-                  onPress={() => handleVehicleSelect(vehicle)}
+                  id={`vehicle-${vehicle.vehicleId}`}
+                  coordinate={[vehicle.currentLocation!.longitude, vehicle.currentLocation!.latitude]}
+                  onSelected={() => handleVehicleSelect(vehicle)}
                 >
                   <View style={[styles.vehicleMarker, { backgroundColor: '#FFC107', borderColor: selectedVehicle?.vehicleId === vehicle.vehicleId ? '#fff' : 'transparent' }]}>
                     <Icon name={getVehicleIcon(vehicle.vehicleType)} size={24} color="#fff" />
                   </View>
-                  <Callout tooltip={false}>
-                    <View style={styles.driverCallout}>
-                      <Text style={styles.driverCalloutType}>{vehicle.vehicleType}</Text>
-                      {vehicle.currentLocation!.address && vehicle.currentLocation!.address !== 'Location not available' ? (
-                        <View style={styles.driverCalloutAddressRow}>
-                          <Icon name="location-on" size={12} color="#4CAF50" />
-                          <Text style={styles.driverCalloutAddress} numberOfLines={2}>
-                            {vehicle.currentLocation!.address}
-                          </Text>
-                        </View>
-                      ) : null}
-                    </View>
-                  </Callout>
-                </Marker>
+                </MapboxGL.PointAnnotation>
               ))
             }
-          </MapView>
+          </MapboxGL.MapView>
         ) : (
           <View style={styles.mapPlaceholder}>
             <ActivityIndicator size="large" color="#4CAF50" />
