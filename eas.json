@@ -6,18 +6,12 @@
     "preview": {
       "android": {
         "buildType": "apk",
-        "gradleCommand": ":app:assembleRelease",
-        "env": {
-          "MAPBOX_DOWNLOAD_TOKEN": "$MAPBOX_DOWNLOAD_TOKEN"
-        }
+        "gradleCommand": ":app:assembleRelease"
       }
     },
     "production": {
       "android": {
-        "buildType": "app-bundle",
-        "env": {
-          "MAPBOX_DOWNLOAD_TOKEN": "$MAPBOX_DOWNLOAD_TOKEN"
-        }
+        "buildType": "app-bundle"
       }
     }
   },
