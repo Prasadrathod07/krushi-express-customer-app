@@ -6,7 +6,7 @@
     "orientation": "portrait",
     "icon": "./assets/images/Krushi.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": false,
+    "newArchEnabled": true,
     "scheme": "krushiexpress",
     "splash": {
       "image": "./assets/images/Krushi.png",
