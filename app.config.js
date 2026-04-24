@@ -7,6 +7,7 @@ module.exports = ({ config }) => {
     ...expo,
     plugins: [
       'expo-secure-store',
+      'expo-router',
       [
         'expo-location',
         {
